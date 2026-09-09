@@ -7,9 +7,6 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-import chromadb
-from sentence_transformers import SentenceTransformer
-
 
 # ============================================================
 # Configuration
@@ -20,8 +17,6 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 DATA_DIR = PROJECT_ROOT / "data"
 DB_PATH = DATA_DIR / "safedoc.db"
 CHROMA_PATH = DATA_DIR / "chroma_db"
-
-DEFAULT_JSON = DATA_DIR / "output" / "Devesh 4th sem.json"
 
 COLLECTION_NAME = "safedoc_documents"
 
@@ -111,17 +106,70 @@ def init_db() -> None:
 
 
 # ============================================================
-# ChromaDB
+# ChromaDB (lazy/optional)
 # ============================================================
+
+_chroma_client: Any | None = None
+_chroma_available: bool | None = None
+
+
+def _get_chroma_client() -> Any | None:
+    """Import and return a ChromaDB PersistentClient lazily.
+
+    Returns None if chromadb is not installed or cannot be imported.
+    """
+
+    global _chroma_client, _chroma_available
+
+    if _chroma_available is False:
+        return None
+
+    if _chroma_client is not None:
+        return _chroma_client
+
+    try:
+        import chromadb as _chromadb
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            "ChromaDB is not available: %s", exc
+        )
+        _chroma_available = False
+        return None
+
+    try:
+        _chroma_client = _chromadb.PersistentClient(
+            path=str(CHROMA_PATH)
+        )
+        _chroma_available = True
+        return _chroma_client
+
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            "ChromaDB client initialization failed: %s", exc
+        )
+        _chroma_available = False
+        return None
+
+
+def is_chroma_available() -> bool:
+    """True once ChromaDB import and client init have succeeded."""
+
+    _get_chroma_client()
+
+    return bool(_chroma_available)
+
 
 def get_chroma_collection():
     """Return the persistent ChromaDB collection."""
 
     CHROMA_PATH.mkdir(parents=True, exist_ok=True)
 
-    client = chromadb.PersistentClient(
-        path=str(CHROMA_PATH)
-    )
+    client = _get_chroma_client()
+
+    if client is None:
+        raise RuntimeError(
+            "ChromaDB is not available."
+        )
 
     collection = client.get_or_create_collection(
         name=COLLECTION_NAME,
@@ -133,31 +181,58 @@ def get_chroma_collection():
     return collection
 
 
+def get_chroma_collection_ignoring_errors():
+    """Return the persistent ChromaDB collection, or None if unavailable.
+
+    This is used by callers that want semantic search to be optional
+    instead of crashing the pipeline.
+    """
+
+    try:
+        return get_chroma_collection()
+
+    except RuntimeError:
+        return None
+
+
 # ============================================================
 # Embedding Model
 # ============================================================
 
-_embedding_model: SentenceTransformer | None = None
+_embedding_model: Any | None = None
 
 
-def get_embedding_model() -> SentenceTransformer:
-    """Load the local Sentence Transformer model once."""
+def get_embedding_model() -> Any:
+    """Load the local Sentence Transformer model once.
+
+    sentence-transformers is optional. If it is unavailable,
+    this function raises a clear error only when embedding is
+    actually needed.
+    """
 
     global _embedding_model
 
-    if _embedding_model is None:
+    if _embedding_model is not None:
+        return _embedding_model
 
-        logger.info(
-            "Loading embedding model: %s",
-            EMBEDDING_MODEL,
-        )
+    try:
+        from sentence_transformers import SentenceTransformer as _StSentenceTransformer
+    except Exception as exc:  # noqa: BLE001
+        raise RuntimeError(
+            "sentence-transformers is not available."
+        ) from exc
 
-        _embedding_model = SentenceTransformer(
-            EMBEDDING_MODEL,
-            device="cpu",
-        )
+    logger.info(
+        "Loading embedding model: %s",
+        EMBEDDING_MODEL,
+    )
 
-        logger.info("Embedding model loaded.")
+    _embedding_model = _StSentenceTransformer(
+        EMBEDDING_MODEL,
+        device="cpu",
+    )
+
+    logger.info("Embedding model loaded.")
 
     return _embedding_model
 
@@ -510,15 +585,47 @@ def ingest_into_sqlite(
     return document_id
 
 
+def resolve_document_id(
+    original_document_path: str | Path,
+) -> int | None:
+    """Find a document by its exact original file path.
+
+    Returns None if no matching row exists.
+    """
+
+    resolved = Path(original_document_path).resolve()
+
+    with get_db_connection() as connection:
+
+        row = connection.execute(
+            """
+            SELECT id FROM documents
+            WHERE file_path = ?
+            ORDER BY id DESC LIMIT 1
+            """,
+            (str(resolved),),
+        ).fetchone()
+
+        if not row:
+            return None
+
+        return int(row[0])
+
+
 # ============================================================
 # Chroma Ingestion
 # ============================================================
 
-def ingest_into_chroma(
+def _ingest_into_chroma_optional(
     parsed_data: dict[str, Any],
     document_id: int,
 ) -> int:
-    """Chunk raw text, create embeddings and store in ChromaDB."""
+    """Chunk raw text, create embeddings and store in ChromaDB.
+
+    This step is optional. If ChromaDB or sentence-transformers
+    are unavailable, this function logs a warning and returns 0
+    instead of crashing the rest of the pipeline.
+    """
 
     raw_text = str(
         parsed_data.get(
@@ -545,9 +652,123 @@ def ingest_into_chroma(
     if not chunks:
         return 0
 
-    collection = get_chroma_collection()
+    client = _get_chroma_client()
+
+    if client is None:
+        logger.warning(
+            "ChromaDB unavailable. Skipping semantic indexing."
+        )
+        return 0
+
+    try:
+        model = get_embedding_model()
+    except RuntimeError as exc:
+        logger.warning(
+            "Embedding model unavailable: %s. Skipping semantic indexing.",
+            exc,
+        )
+        return 0
+
+    collection = client.get_or_create_collection(
+        name=COLLECTION_NAME,
+        metadata={
+            "description": "SafeDocAI document semantic search"
+        },
+    )
+
+    try:
+        embeddings = model.encode(
+            chunks,
+            batch_size=16,
+            show_progress_bar=False,
+            normalize_embeddings=True,
+        )
+
+        ids = [
+            f"doc_{document_id}_chunk_{index}"
+            for index in range(len(chunks))
+        ]
+
+        metadatas = [
+            {
+                "document_id": str(document_id),
+                "file_name": file_name,
+                "chunk_id": index,
+            }
+            for index in range(len(chunks))
+        ]
+
+        collection.upsert(
+            ids=ids,
+            documents=chunks,
+            embeddings=embeddings.tolist(),
+            metadatas=metadatas,
+        )
+
+        logger.info(
+            "ChromaDB ingestion complete. chunks=%s",
+            len(chunks),
+        )
+
+        return len(chunks)
+
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            "ChromaDB ingestion failed: %s", exc
+        )
+        return 0
+
+
+def ingest_into_chroma(
+    parsed_data: dict[str, Any],
+    document_id: int,
+) -> int:
+    """Chunk raw text, create embeddings and store in ChromaDB.
+
+    This function expects ChromaDB to already be available.
+    For a tolerant version, use _ingest_into_chroma_optional().
+    """
+
+    raw_text = str(
+        parsed_data.get(
+            "raw_text",
+            "",
+        )
+    ).strip()
+
+    if not raw_text:
+        logger.warning(
+            "No raw_text found. Skipping ChromaDB ingestion."
+        )
+        return 0
+
+    file_name = str(
+        parsed_data.get(
+            "file_name",
+            "unknown",
+        )
+    )
+
+    chunks = chunk_text(raw_text)
+
+    if not chunks:
+        return 0
+
+    client = _get_chroma_client()
+
+    if client is None:
+        raise RuntimeError(
+            "ChromaDB is not available."
+        )
 
     model = get_embedding_model()
+
+    collection = client.get_or_create_collection(
+        name=COLLECTION_NAME,
+        metadata={
+            "description": "SafeDocAI document semantic search"
+        },
+    )
 
     embeddings = model.encode(
         chunks,
@@ -570,7 +791,6 @@ def ingest_into_chroma(
         for index in range(len(chunks))
     ]
 
-    # Upsert makes re-ingestion safe.
     collection.upsert(
         ids=ids,
         documents=chunks,
@@ -594,7 +814,7 @@ def ingest_parsed_json(
     json_path: str | Path,
 ) -> dict[str, Any]:
     """
-    Ingest Phase 1 JSON into both SQLite and ChromaDB.
+    Ingest Phase 1 JSON into SQLite and, if available, ChromaDB.
     """
 
     init_db()
@@ -608,10 +828,12 @@ def ingest_parsed_json(
         json_path,
     )
 
-    chunk_count = ingest_into_chroma(
+    chroma_chunks = _ingest_into_chroma_optional(
         parsed_data,
         document_id,
     )
+
+    chroma_ready = is_chroma_available()
 
     return {
         "document_id": document_id,
@@ -619,7 +841,182 @@ def ingest_parsed_json(
             "file_name"
         ),
         "sqlite": True,
-        "chroma_chunks": chunk_count,
+        "chroma": {
+            "available": chroma_ready,
+            "chunks": chroma_chunks,
+        },
+        "status": "success",
+    }
+
+
+# ============================================================
+# Verified Metadata Storage (Phase 3)
+# ============================================================
+
+def store_verified_metadata(
+    document_id: int,
+    understanding: dict[str, Any],
+) -> int:
+    """Store verified fields from Phase 3 understanding into SQLite.
+
+    Only stores fields marked as 'verified': true.
+    Uses the provided document_id directly - does not search by file path.
+    """
+
+    fields = understanding.get("fields", [])
+
+    if not fields:
+        return 0
+
+    # Verify document exists before storing metadata
+    with get_db_connection() as connection:
+
+        # Check that the document_id exists in the documents table
+        doc_exists = connection.execute(
+            """
+            SELECT id FROM documents WHERE id = ? LIMIT 1
+            """,
+            (document_id,),
+        ).fetchone()
+
+        if not doc_exists:
+            logger.warning(
+                "Document ID %d not found in database, skipping metadata storage",
+                document_id,
+            )
+            return 0
+
+    stored_count = 0
+
+    with get_db_connection() as connection:
+
+        for field in fields:
+            if not isinstance(field, dict):
+                continue
+
+            if not field.get("verified", False):
+                continue
+
+            key = str(field.get("key", "")).strip()
+            value = str(field.get("value", "")).strip()
+
+            if not key or not value or value.upper() in (
+                "UNKNOWN", "", "NONE", "N/A"
+            ):
+                continue
+
+            # Check for duplicate to avoid redundant entries
+            existing_field = connection.execute(
+                """
+                SELECT id FROM extracted_metadata
+                WHERE document_id = ?
+                  AND field_name = ?
+                  AND field_value = ?
+                LIMIT 1
+                """,
+                (document_id, key, value),
+            ).fetchone()
+
+            if existing_field:
+                continue
+
+            connection.execute(
+                """
+                INSERT INTO extracted_metadata
+                (document_id, field_name, field_value)
+                VALUES (?, ?, ?)
+                """,
+                (document_id, key, value),
+            )
+
+            stored_count += 1
+
+        connection.commit()
+
+    if stored_count > 0:
+        logger.info(
+            "Stored %d verified fields for document_id=%d",
+            stored_count,
+            document_id,
+        )
+
+    return stored_count
+
+
+def store_understanding_results(
+    json_path: str | Path,
+    understanding: dict[str, Any],
+    original_document_path: str | Path | None = None,
+) -> dict[str, Any]:
+    """Store Phase 3 understanding results.
+
+    Links to an existing document by its exact original file path.
+    A filename-only fallback is intentionally not used, because it
+    can link verified fields to the wrong document when multiple
+    files share the same name.
+
+    Args:
+        json_path: Path to the Phase 3 understanding JSON (for reference)
+        understanding: The Phase 3 understanding dict
+        original_document_path: Path to the ORIGINAL document (PDF/image),
+            NOT the Phase 1 JSON or Phase 3 understanding JSON.
+            This is used to find the document in SQLite if document_id is not available.
+    
+    Returns:
+        dict with document_id, stored count, and status
+    """
+
+    raw_document_id = understanding.get("document_id")
+
+    if isinstance(raw_document_id, int):
+        document_id = raw_document_id
+
+    elif isinstance(raw_document_id, str) and raw_document_id.strip().isdigit():
+        document_id = int(raw_document_id)
+
+    else:
+        document_id = None
+
+    if document_id is not None:
+        stored_count = store_verified_metadata(
+            document_id,
+            understanding,
+        )
+
+        return {
+            "document_id": document_id,
+            "stored": stored_count,
+            "status": "success",
+        }
+
+    if original_document_path is None:
+        return {
+            "stored": 0,
+            "error": "Cannot determine original document path",
+        }
+
+    document_id = resolve_document_id(original_document_path)
+
+    if document_id is None:
+        resolved = Path(original_document_path).resolve()
+
+        return {
+            "stored": 0,
+            "error": (
+                "Document not found in database for original path: "
+                f"{resolved}"
+            ),
+            "status": "error",
+        }
+
+    stored_count = store_verified_metadata(
+        document_id,
+        understanding,
+    )
+
+    return {
+        "document_id": document_id,
+        "stored": stored_count,
         "status": "success",
     }
 
@@ -734,7 +1131,11 @@ def query_semantic(
     query: str,
     top_k: int = 3,
 ) -> list[dict[str, Any]]:
-    """Search ChromaDB using local semantic embeddings."""
+    """Search ChromaDB using local semantic embeddings.
+
+    This function requires ChromaDB and sentence-transformers.
+    If either is unavailable, it raises a clear RuntimeError.
+    """
 
     query = query.strip()
 
@@ -823,6 +1224,95 @@ def semantic_search(
     )
 
 
+def query_semantic_optional(
+    query: str,
+    top_k: int = 3,
+) -> list[dict[str, Any]]:
+    """Semantic search that remains optional.
+
+    If ChromaDB or the embedding model are unavailable, this
+    returns an empty list instead of crashing the caller.
+    """
+
+    query = query.strip()
+
+    if not query:
+        raise ValueError(
+            "Semantic query cannot be empty."
+        )
+
+    if top_k <= 0:
+        raise ValueError(
+            "top_k must be greater than 0."
+        )
+
+    collection = get_chroma_collection_ignoring_errors()
+
+    if collection is None or collection.count() == 0:
+        return []
+
+    try:
+        model = get_embedding_model()
+
+    except RuntimeError:
+        return []
+
+    query_embedding = model.encode(
+        [query],
+        normalize_embeddings=True,
+    )[0].tolist()
+
+    results = collection.query(
+        query_embeddings=[query_embedding],
+        n_results=min(
+            top_k,
+            collection.count(),
+        ),
+        include=[
+            "documents",
+            "metadatas",
+            "distances",
+        ],
+    )
+
+    documents = results.get(
+        "documents",
+        [[]],
+    )[0]
+
+    metadatas = results.get(
+        "metadatas",
+        [[]],
+    )[0]
+
+    distances = results.get(
+        "distances",
+        [[]],
+    )[0]
+
+    output: list[dict[str, Any]] = []
+
+    for index, document in enumerate(documents):
+
+        output.append(
+            {
+                "text": document,
+                "metadata": (
+                    metadatas[index]
+                    if index < len(metadatas)
+                    else {}
+                ),
+                "distance": (
+                    distances[index]
+                    if index < len(distances)
+                    else None
+                ),
+            }
+        )
+
+    return output
+
+
 # ============================================================
 # Test Harness
 # ============================================================
@@ -836,16 +1326,43 @@ def main() -> None:
     print("==============================")
     print()
 
+    default_json = Path(__file__).resolve().parent.parent / "data" / "output"
+
+    candidate_files = sorted(default_json.glob("*.json"))
+
     print("Initializing SQLite...")
     init_db()
 
+    if not candidate_files:
+        print()
+        print("No JSON files found in data/output/.")
+        print("Stored documents can still be queried once ingested.")
+        print()
+        print("==============================")
+        print("Phase 2 storage test complete.")
+        print("==============================")
+        return
+
+    target_json = candidate_files[0]
+
     print()
     print("Ingesting Phase 1 JSON:")
-    print(DEFAULT_JSON)
+    print(target_json)
 
-    ingestion_result = ingest_parsed_json(
-        DEFAULT_JSON
-    )
+    try:
+        ingestion_result = ingest_parsed_json(
+            target_json
+        )
+
+    except FileNotFoundError as exc:
+        print()
+        print("Ingestion failed:")
+        print(exc)
+        print()
+        print("==============================")
+        print("Phase 2 storage test complete.")
+        print("==============================")
+        return
 
     print()
     print("Ingestion result:")
@@ -880,29 +1397,37 @@ def main() -> None:
     # Semantic query
     # --------------------------------------------------------
 
-    print()
-    print("=== Semantic Search ===")
+    chroma_ready = ingestion_result.get("chroma", {}).get("available", False)
 
-    semantic_results = query_semantic(
-        "marksheet subjects",
-        top_k=3,
-    )
-
-    for index, result in enumerate(
-        semantic_results,
-        start=1,
-    ):
+    if chroma_ready:
         print()
-        print(f"Result {index}")
-        print(
-            f"Distance: {result['distance']}"
+        print("=== Semantic Search ===")
+
+        semantic_results = query_semantic(
+            "marksheet subjects",
+            top_k=3,
         )
-        print(
-            f"Metadata: {result['metadata']}"
-        )
-        print(
-            f"Text: {result['text']}"
-        )
+
+        for index, result in enumerate(
+            semantic_results,
+            start=1,
+        ):
+            print()
+            print(f"Result {index}")
+            print(
+                f"Distance: {result['distance']}"
+            )
+            print(
+                f"Metadata: {result['metadata']}"
+            )
+            print(
+                f"Text: {result['text']}"
+            )
+
+    else:
+        print()
+        print("=== Semantic Search ===")
+        print("Skipped: ChromaDB or embedding model unavailable.")
 
     print()
     print("==============================")

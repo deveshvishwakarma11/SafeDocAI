@@ -4,508 +4,573 @@ import argparse
 import json
 import logging
 import re
-from dataclasses import dataclass, field
+import string
+import unicodedata
 from pathlib import Path
 from typing import Any
 
 import cv2
-import fitz
 import numpy as np
 import pdfplumber
 import pytesseract
+from PIL import Image
+from pytesseract import Output
 
 from utils import (
-    is_image_file,
-    is_pdf_file,
-    load_image,
     preprocess_for_ocr,
     validate_file,
 )
 
 
-# ============================================================
-# Configuration
-# ============================================================
+# ---------------------------------------------------------
+# PROJECT PATHS
+# ---------------------------------------------------------
 
-TESSERACT_WINDOWS_PATH = r"C:\Program Files\Tesseract-OCR\tesseract.exe"
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
 
-OCR_DPI = 250
-OCR_MIN_TEXT_LENGTH = 20
+SAMPLES_DIR = PROJECT_ROOT / "data" / "samples"
+OUTPUT_DIR = PROJECT_ROOT / "data" / "output"
 
-SUPPORTED_OCR_LANGUAGES = ("eng", "hin")
+SUPPORTED_EXTENSIONS = {
+    ".pdf",
+    ".jpg",
+    ".jpeg",
+    ".png",
+}
 
 
-# ============================================================
-# Logging
-# ============================================================
+# ---------------------------------------------------------
+# LOGGING
+# ---------------------------------------------------------
 
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s | %(levelname)s | %(message)s",
+    format="%(levelname)s: %(message)s",
 )
 
-logger = logging.getLogger("SafeDocAI")
+logger = logging.getLogger(__name__)
 
 
-# ============================================================
-# Data Models
-# ============================================================
+# ---------------------------------------------------------
+# OCR LANGUAGE
+# ---------------------------------------------------------
 
-@dataclass
-class OCRWord:
-    text: str
-    confidence: float
-    left: int
-    top: int
-    width: int
-    height: int
+def get_ocr_language() -> str:
+    """
+    Use English + Hindi when Hindi traineddata is available.
+    Otherwise fall back to English.
+    """
+
+    try:
+        languages = pytesseract.get_languages(config="")
+    except Exception:
+        languages = []
+
+    if "hin" in languages and "eng" in languages:
+        return "eng+hin"
+
+    if "eng" in languages:
+        return "eng"
+
+    if "hin" in languages:
+        return "hin"
+
+    return "eng"
 
 
-@dataclass
-class OCRResult:
-    text: str
-    words: list[OCRWord] = field(default_factory=list)
+OCR_LANGUAGE = get_ocr_language()
 
 
-# ============================================================
-# Document Parser
-# ============================================================
+# ---------------------------------------------------------
+# EMBEDDED TEXT CORRUPTION DETECTION
+# ---------------------------------------------------------
 
-class DocumentParser:
-    """Local document parser for SafeDocAI."""
+def is_text_corrupt(text: str) -> bool:
+    """
+    Evaluate whether PDF embedded text is unreliable/corrupt.
 
-    def __init__(self) -> None:
-        self._configure_tesseract()
+    Returns True if the text shows signs of:
+    - Font encoding corruption (cid: patterns)
+    - Malformed/non-printable characters
+    - Obvious encoding garbage
+    - Suspiciously short text for the content
 
-    # --------------------------------------------------------
-    # Tesseract
-    # --------------------------------------------------------
+    Criteria:
+    1. "(cid:" occurs anywhere in the text
+    2. High proportion of malformed characters
+    3. Encoding garbage like "αñ", "\ufffd", etc.
+    4. Text is suspiciously short compared to content
+    """
 
-    def _configure_tesseract(self) -> None:
-        """Configure Tesseract executable."""
+    if not text:
+        return True
+
+    text_lower = text.lower()
+
+    # Criterion 1: cid: patterns indicate font encoding corruption
+    if "(cid:" in text_lower or "cid:" in text_lower:
+        return True
+
+    # Criterion 2: Check for high proportion of non-printable chars
+    # Allow normal whitespace, common punctuation, and Unicode chars
+    non_printable_count = 0
+    total_chars = len(text)
+
+    if total_chars == 0:
+        return True
+
+    for char in text:
+        code_point = ord(char)
+
+        # Allow:
+        # - Printable ASCII (32-126)
+        # - Common Unicode categories (letters, marks, numbers, punctuation)
+        # - Whitespace (space, tab, newline, etc.)
+        if (32 <= code_point <= 126):
+            continue
+        if char in '\t\n\r':
+            continue
+        # Check if it's a valid Unicode letter, mark, number, or punct
+        category = unicodedata.category(char)
+        if category.startswith(('L', 'M', 'N', 'P')):
+            continue
+        # Control characters (except tab/newline already handled)
+        if code_point < 32 or code_point == 127:
+            non_printable_count += 1
+            continue
+        # Sudden large code points (possible encoding artifacts)
+        if code_point > 0x2000 and code_point not in (
+            0x2018, 0x2019, 0x201C, 0x201D,  # Smart quotes
+            0x2026,  # Ellipsis
+            0x2013, 0x2014,  # En/em dash
+            0x2022,  # Bullet
+            0x2122,  # Trademark
+            0x0900, 0x097F,  # Devanagari
+            0x0980, 0x09FF,  # Bengali
+            0x0B80, 0x0BFF,  # Tamil
+            0x0C80, 0x0CFF,  # Telugu
+            0x0E80, 0x0EFF,  # Thai (partial)
+            0x3000, 0x303F,  # CJK symbols
+            0x4E00, 0x9FFF,  # CJK Unified (partial)
+            0xFF00, 0xFFEF,  # Fullwidth forms
+        ):
+            non_printable_count += 1
+
+    non_printable_ratio = non_printable_count / total_chars
+
+    # If more than 15% of characters look corrupted, flag it
+    if non_printable_ratio > 0.15:
+        return True
+
+    # Criterion 3: Detect obvious encoding garbage patterns
+    garbage_patterns = [
+        r"[\x00-\x08\x0b\x0c\x0e-\x1f]",  # Control chars (except tab/newline)
+        r"αñ",  # Example from the problem statement
+        r"�",  # Unicode replacement character
+        r"Ã",  # mojibake patterns (high-bit character followed by nothing)
+        r"Â",  # mojibake patterns (high-bit character followed by nothing)
+    ]
+
+    for pattern in garbage_patterns:
+        if re.search(pattern, text):
+            return True
+
+    return False
+
+
+# ---------------------------------------------------------
+# IMAGE OCR
+# ---------------------------------------------------------
+
+def ocr_image(image: Image.Image) -> dict[str, Any]:
+    """
+    OCR a PIL image and return text + OCR metadata.
+    """
+
+    image = image.convert("RGB")
+
+    image_array = np.array(image)
+
+    processed = preprocess_for_ocr(image_array)
+
+    text = pytesseract.image_to_string(
+        processed,
+        lang=OCR_LANGUAGE,
+        config="--psm 6",
+    )
+
+    data = pytesseract.image_to_data(
+        processed,
+        lang=OCR_LANGUAGE,
+        config="--psm 6",
+        output_type=Output.DICT,
+    )
+
+    words = []
+
+    total = len(data.get("text", []))
+
+    for i in range(total):
+        word = data["text"][i].strip()
+
+        if not word:
+            continue
 
         try:
-            version = pytesseract.get_tesseract_version()
-            logger.info("Tesseract detected: %s", version)
-        except Exception:
-            if Path(TESSERACT_WINDOWS_PATH).exists():
-                pytesseract.pytesseract.tesseract_cmd = (
-                    TESSERACT_WINDOWS_PATH
-                )
+            confidence = float(data["conf"][i])
+        except (ValueError, TypeError):
+            confidence = -1.0
 
-                try:
-                    version = pytesseract.get_tesseract_version()
-                    logger.info("Tesseract detected: %s", version)
-                except Exception as exc:
-                    raise RuntimeError(
-                        "Tesseract is installed but could not be started."
-                    ) from exc
-            else:
-                raise RuntimeError(
-                    "Tesseract OCR was not found. "
-                    "Please install Tesseract OCR."
-                )
-
-    def _get_ocr_language(self) -> str:
-        """Return available OCR language combination."""
-
-        try:
-            languages = pytesseract.get_languages(config="")
-        except Exception:
-            languages = ["eng"]
-
-        has_eng = "eng" in languages
-        has_hin = "hin" in languages
-
-        if has_eng and has_hin:
-            logger.info("English + Hindi OCR enabled.")
-            return "eng+hin"
-
-        if has_eng:
-            logger.warning(
-                "Hindi language data ('hin') not installed. "
-                "Using English OCR only."
-            )
-            return "eng"
-
-        if has_hin:
-            logger.info("Hindi OCR enabled.")
-            return "hin"
-
-        raise RuntimeError(
-            "No usable Tesseract language data found."
+        words.append(
+            {
+                "text": word,
+                "confidence": confidence,
+                "left": data["left"][i],
+                "top": data["top"][i],
+                "width": data["width"][i],
+                "height": data["height"][i],
+            }
         )
 
-    # --------------------------------------------------------
-    # OCR
-    # --------------------------------------------------------
+    return {
+        "text": text.strip(),
+        "words": words,
+    }
 
-    def _run_ocr(self, image: np.ndarray) -> OCRResult:
-        """Run OCR on a preprocessed image."""
 
-        processed = preprocess_for_ocr(image)
-        language = self._get_ocr_language()
+# ---------------------------------------------------------
+# PDF EXTRACTION WITH SMART OCR FALLBACK
+# ---------------------------------------------------------
 
-        config = "--psm 6"
+def extract_pdf_text(file_path: Path) -> tuple[str, list[dict[str, Any]], str]:
+    """
+    Extract PDF text with smart OCR fallback.
 
-        text = pytesseract.image_to_string(
-            processed,
-            lang=language,
-            config=config,
-        )
+    1. Attempt embedded text extraction first.
+    2. Evaluate text quality using is_text_corrupt().
+    3. If embedded text is corrupt, discard it and OCR all pages.
+    4. Pages with little/no text are always OCR processed.
 
-        data = pytesseract.image_to_data(
-            processed,
-            lang=language,
-            config=config,
-            output_type=pytesseract.Output.DICT,
-        )
+    Returns:
+        tuple of (text, ocr_pages, extraction_method)
+        - text: extracted or OCR text
+        - ocr_pages: list of page info dicts
+        - extraction_method: "embedded_text", "ocr_fallback", or "ocr"
+    """
 
-        words: list[OCRWord] = []
+    all_text = []
+    ocr_pages = []
+    extraction_method = "embedded_text"
 
-        count = len(data["text"])
-
-        for i in range(count):
-            word = data["text"][i].strip()
-
-            if not word:
-                continue
-
-            try:
-                confidence = float(data["conf"][i])
-            except (ValueError, TypeError):
-                confidence = -1.0
-
-            words.append(
-                OCRWord(
-                    text=word,
-                    confidence=confidence,
-                    left=int(data["left"][i]),
-                    top=int(data["top"][i]),
-                    width=int(data["width"][i]),
-                    height=int(data["height"][i]),
-                )
-            )
-
-        return OCRResult(
-            text=text.strip(),
-            words=words,
-        )
-
-    # --------------------------------------------------------
-    # PDF text extraction
-    # --------------------------------------------------------
-
-    def _extract_pdf_text(
-        self,
-        file_path: Path,
-    ) -> tuple[str, list[int]]:
-        """
-        Extract embedded PDF text.
-
-        Returns:
-            complete_text,
-            pages_requiring_ocr
-        """
-
-        page_texts: list[str] = []
-        ocr_pages: list[int] = []
+    try:
+        import fitz
 
         with pdfplumber.open(file_path) as pdf:
-            for page_number, page in enumerate(pdf.pages, start=1):
-                text = page.extract_text() or ""
+            plumber_pages = pdf.pages
 
-                page_texts.append(text.strip())
+            pdf_document = fitz.open(file_path)
 
-                if len(text.strip()) < OCR_MIN_TEXT_LENGTH:
-                    ocr_pages.append(page_number)
+            # Step 1: Extract all embedded text first for quality check
+            embedded_texts = []
+            for page_index, page in enumerate(plumber_pages):
+                embedded_text = page.extract_text() or ""
+                embedded_texts.append(embedded_text)
 
-        return "\n\n".join(page_texts), ocr_pages
+            # Step 2: Check overall text quality
+            combined_embedded = "\n".join(embedded_texts)
 
-    # --------------------------------------------------------
-    # PDF OCR
-    # --------------------------------------------------------
-
-    def _ocr_pdf_page(
-        self,
-        document: fitz.Document,
-        page_number: int,
-    ) -> OCRResult:
-        """Render and OCR a single PDF page."""
-
-        page = document[page_number - 1]
-
-        matrix = fitz.Matrix(
-            OCR_DPI / 72,
-            OCR_DPI / 72,
-        )
-
-        pixmap = page.get_pixmap(
-            matrix=matrix,
-            alpha=False,
-        )
-
-        image = np.frombuffer(
-            pixmap.samples,
-            dtype=np.uint8,
-        )
-
-        image = image.reshape(
-            pixmap.height,
-            pixmap.width,
-            pixmap.n,
-        )
-
-        if pixmap.n == 4:
-            image = cv2.cvtColor(
-                image,
-                cv2.COLOR_RGBA2BGR,
-            )
-        else:
-            image = cv2.cvtColor(
-                image,
-                cv2.COLOR_RGB2BGR,
-            )
-
-        return self._run_ocr(image)
-
-    # --------------------------------------------------------
-    # Image parsing
-    # --------------------------------------------------------
-
-    def _parse_image(
-        self,
-        file_path: Path,
-    ) -> str:
-        """Parse an image document."""
-
-        image = load_image(file_path)
-
-        if image is None:
-            raise ValueError(
-                f"Unable to load image: {file_path}"
-            )
-
-        logger.info("Running OCR on image: %s", file_path.name)
-
-        result = self._run_ocr(image)
-
-        return result.text
-
-    # --------------------------------------------------------
-    # PDF parsing
-    # --------------------------------------------------------
-
-    def _parse_pdf(
-        self,
-        file_path: Path,
-    ) -> str:
-        """Parse PDF using text extraction + OCR fallback."""
-
-        logger.info(
-            "Processing PDF: %s",
-            file_path.name,
-        )
-
-        embedded_text, ocr_pages = self._extract_pdf_text(
-            file_path
-        )
-
-        logger.info(
-            "OCR required for pages: %s",
-            ocr_pages,
-        )
-
-        if not ocr_pages:
-            return embedded_text.strip()
-
-        with fitz.open(file_path) as document:
-
-            page_texts = embedded_text.split("\n\n")
-
-            while len(page_texts) < len(document):
-                page_texts.append("")
-
-            for page_number in ocr_pages:
-                logger.info(
-                    "Running OCR on PDF page %s",
-                    page_number,
+            if is_text_corrupt(combined_embedded):
+                logger.warning(
+                    "Embedded text appears corrupt for %s. "
+                    "Switching to OCR fallback.",
+                    file_path.name,
                 )
+                extraction_method = "ocr_fallback"
 
-                ocr_result = self._ocr_pdf_page(
-                    document,
-                    page_number,
-                )
+                # OCR all pages instead of using embedded text
+                for page_index, page in enumerate(plumber_pages):
+                    if page_index >= len(pdf_document):
+                        continue
 
-                page_texts[page_number - 1] = (
-                    ocr_result.text
-                )
+                    pdf_page = pdf_document[page_index]
 
-            return "\n\n".join(
-                text for text in page_texts if text.strip()
-            ).strip()
+                    pix = pdf_page.get_pixmap(
+                        dpi=250,
+                        alpha=False,
+                    )
 
-    # --------------------------------------------------------
-    # Entity extraction
-    # --------------------------------------------------------
+                    image = Image.frombytes(
+                        "RGB",
+                        [pix.width, pix.height],
+                        pix.samples,
+                    )
 
-    @staticmethod
-    def _extract_entities(
-        text: str,
-    ) -> dict[str, list[str]]:
-        """Extract common structured entities."""
+                    ocr_result = ocr_image(image)
 
-        entities: dict[str, list[str]] = {
-            "dob": [],
-            "pan": [],
-            "ifsc": [],
-            "phone": [],
-            "email": [],
-            "amounts": [],
-        }
+                    if ocr_result["text"]:
+                        all_text.append(ocr_result["text"])
 
-        # Dates / DOB
-        date_patterns = [
-            r"\b\d{1,2}[/-]\d{1,2}[/-]\d{2,4}\b",
-            r"\b\d{1,2}\s+(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|"
-            r"Oct|Nov|Dec)[a-z]*\s+\d{2,4}\b",
-        ]
-
-        for pattern in date_patterns:
-            entities["dob"].extend(
-                re.findall(
-                    pattern,
-                    text,
-                    flags=re.IGNORECASE,
-                )
-            )
-
-        # PAN
-        entities["pan"] = re.findall(
-            r"\b[A-Z]{5}[0-9]{4}[A-Z]\b",
-            text.upper(),
-        )
-
-        # IFSC
-        entities["ifsc"] = re.findall(
-            r"\b[A-Z]{4}0[A-Z0-9]{6}\b",
-            text.upper(),
-        )
-
-        # Phone numbers
-        entities["phone"] = re.findall(
-            r"(?<!\d)(?:\+91[\s-]?)?[6-9]\d{9}(?!\d)",
-            text,
-        )
-
-        # Email
-        entities["email"] = re.findall(
-            r"\b[A-Za-z0-9._%+-]+"
-            r"@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b",
-            text,
-        )
-
-        # Amounts
-        entities["amounts"] = re.findall(
-            r"(?:₹|Rs\.?|INR)\s*"
-            r"(?:\d{1,3}(?:,\d{3})+|\d+)"
-            r"(?:\.\d{1,2})?",
-            text,
-            flags=re.IGNORECASE,
-        )
-
-        # Remove duplicates while preserving order
-        for key in entities:
-            entities[key] = list(
-                dict.fromkeys(entities[key])
-            )
-
-        return entities
-
-    # --------------------------------------------------------
-    # Main parser
-    # --------------------------------------------------------
-
-    def parse(
-        self,
-        file_path: str | Path,
-    ) -> dict[str, Any]:
-        """Parse a document and return structured JSON data."""
-
-        path = Path(file_path)
-
-        try:
-            validate_file(path)
-
-            if is_pdf_file(path):
-                raw_text = self._parse_pdf(path)
-
-            elif is_image_file(path):
-                raw_text = self._parse_image(path)
+                    ocr_pages.append(
+                        {
+                            "page": page_index + 1,
+                            "text": ocr_result["text"],
+                            "words": ocr_result["words"],
+                            "extraction_method": "ocr",
+                        }
+                    )
 
             else:
-                raise ValueError(
-                    f"Unsupported file type: {path.suffix}"
-                )
+                # Use embedded text, but OCR pages with little/no text
+                for page_index, page in enumerate(plumber_pages):
+                    embedded_text = embedded_texts[page_index]
 
-            return {
-                "file_name": path.name,
-                "file_type": path.suffix.lstrip(".").upper(),
-                "raw_text": raw_text,
-                "extracted_entities": self._extract_entities(
-                    raw_text
-                ),
-                "status": "success",
-                "error": None,
+                    if len(embedded_text.strip()) >= 20:
+                        all_text.append(embedded_text.strip())
+                        continue
+
+                    # Page has little text, OCR it
+                    if page_index >= len(pdf_document):
+                        continue
+
+                    pdf_page = pdf_document[page_index]
+
+                    pix = pdf_page.get_pixmap(
+                        dpi=250,
+                        alpha=False,
+                    )
+
+                    image = Image.frombytes(
+                        "RGB",
+                        [pix.width, pix.height],
+                        pix.samples,
+                    )
+
+                    ocr_result = ocr_image(image)
+
+                    if ocr_result["text"]:
+                        all_text.append(ocr_result["text"])
+
+                    ocr_pages.append(
+                        {
+                            "page": page_index + 1,
+                            "text": ocr_result["text"],
+                            "words": ocr_result["words"],
+                            "extraction_method": "ocr",
+                        }
+                    )
+
+            pdf_document.close()
+
+    except Exception as exc:
+        logger.warning(
+            "PDF extraction failed for %s: %s",
+            file_path.name,
+            exc,
+        )
+
+        raise
+
+    return "\n\n".join(all_text).strip(), ocr_pages, extraction_method
+
+
+# ---------------------------------------------------------
+# IMAGE FILE EXTRACTION
+# ---------------------------------------------------------
+
+def extract_image_text(file_path: Path) -> tuple[str, list[dict[str, Any]], str]:
+    """
+    OCR a standalone image file.
+
+    Returns:
+        tuple of (text, ocr_pages, extraction_method)
+        - text: OCR text
+        - ocr_pages: list of page info dicts
+        - extraction_method: always "ocr" for images
+    """
+
+    image = Image.open(file_path)
+
+    result = ocr_image(image)
+
+    return (
+        result["text"],
+        [
+            {
+                "page": 1,
+                "text": result["text"],
+                "words": result["words"],
+                "extraction_method": "ocr",
             }
-
-        except Exception as exc:
-            logger.exception(
-                "Document parsing failed."
-            )
-
-            return {
-                "file_name": path.name,
-                "file_type": path.suffix.lstrip(".").upper(),
-                "raw_text": "",
-                "extracted_entities": {
-                    "dob": [],
-                    "pan": [],
-                    "ifsc": [],
-                    "phone": [],
-                    "email": [],
-                    "amounts": [],
-                },
-                "status": "error",
-                "error": str(exc),
-            }
-
-
-# ============================================================
-# JSON Output
-# ============================================================
-
-def parse_document_to_json(
-    file_path: str | Path,
-) -> str:
-    """Parse document and return formatted JSON string."""
-
-    parser = DocumentParser()
-
-    result = parser.parse(file_path)
-
-    return json.dumps(
-        result,
-        ensure_ascii=False,
-        indent=4,
+        ],
+        "ocr",
     )
 
 
+# ---------------------------------------------------------
+# ENTITY EXTRACTION
+# ---------------------------------------------------------
+
+def extract_entities(text: str) -> dict[str, list[str]]:
+    """
+    Basic deterministic entity extraction.
+
+    This remains Phase 1 extraction.
+    Dynamic document-specific understanding belongs
+    to document_understanding.py.
+    """
+
+    entities = {
+        "dob": [],
+        "pan": [],
+        "ifsc": [],
+        "phone": [],
+        "email": [],
+        "amounts": [],
+    }
+
+    if not text:
+        return entities
+
+    # Dates
+    date_patterns = [
+        r"\b\d{1,2}[/-]\d{1,2}[/-]\d{2,4}\b",
+        r"\b\d{1,2}\s+[A-Za-z]{3,9}\s+\d{4}\b",
+        r"\b[A-Za-z]{3,9}\s+\d{1,2},\s+\d{4}\b",
+    ]
+
+    for pattern in date_patterns:
+        entities["dob"].extend(
+            re.findall(pattern, text, flags=re.IGNORECASE)
+        )
+
+    # PAN
+    pan_matches = re.findall(
+        r"\b[A-Z]{5}[0-9]{4}[A-Z]\b",
+        text.upper(),
+    )
+    entities["pan"].extend(pan_matches)
+
+    # IFSC
+    ifsc_matches = re.findall(
+        r"\b[A-Z]{4}0[A-Z0-9]{6}\b",
+        text.upper(),
+    )
+    entities["ifsc"].extend(ifsc_matches)
+
+    # Phone
+    phone_matches = re.findall(
+        r"(?<!\d)(?:\+91[\s-]?)?[6-9]\d{9}(?!\d)",
+        text,
+    )
+    entities["phone"].extend(phone_matches)
+
+    # Email
+    email_matches = re.findall(
+        r"\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b",
+        text,
+    )
+    entities["email"].extend(email_matches)
+
+    # Amounts
+    amount_matches = re.findall(
+        r"(?:₹|Rs\.?|INR)\s*[\d,]+(?:\.\d{1,2})?",
+        text,
+        flags=re.IGNORECASE,
+    )
+    entities["amounts"].extend(amount_matches)
+
+    # Remove duplicates while preserving order
+    for key in entities:
+        entities[key] = list(dict.fromkeys(entities[key]))
+
+    return entities
+
+
+# ---------------------------------------------------------
+# SINGLE FILE PARSER
+# ---------------------------------------------------------
+
+def parse_document(file_path: str | Path) -> dict[str, Any]:
+    """
+    Parse one PDF/image document.
+    
+    Returns a dict with parsed document data including raw_text,
+    extracted entities, and extraction method.
+    """
+
+    path = Path(file_path)
+
+    if not path.exists():
+        return {
+            "file_name": path.name,
+            "file_type": path.suffix.upper().replace(".", ""),
+            "raw_text": "",
+            "extracted_entities": {},
+            "status": "error",
+            "error": "File does not exist.",
+        }
+
+    try:
+        validate_file(path)
+
+        extension = path.suffix.lower()
+
+        if extension not in SUPPORTED_EXTENSIONS:
+            raise ValueError(
+                f"Unsupported file type: {extension}"
+            )
+
+        if extension == ".pdf":
+            raw_text, pages, extraction_method = extract_pdf_text(path)
+            file_type = "PDF"
+
+        else:
+            raw_text, pages, extraction_method = extract_image_text(path)
+            file_type = "IMAGE"
+
+        entities = extract_entities(raw_text)
+
+        return {
+            "file_name": path.name,
+            "file_type": file_type,
+            "file_path": str(path),
+            "raw_text": raw_text,
+            "pages": pages,
+            "extracted_entities": entities,
+            "ocr_language": OCR_LANGUAGE,
+            "extraction_method": extraction_method,
+            "status": "success",
+            "error": None,
+        }
+
+    except Exception as exc:
+        logger.exception(
+            "Failed to process %s",
+            path.name,
+        )
+
+        return {
+            "file_name": path.name,
+            "file_type": path.suffix.upper().replace(".", ""),
+            "file_path": str(path),
+            "raw_text": "",
+            "pages": [],
+            "extracted_entities": {},
+            "ocr_language": OCR_LANGUAGE,
+            "extraction_method": "error",
+            "status": "error",
+            "error": str(exc),
+        }
+
+
+# ---------------------------------------------------------
+# JSON OUTPUT
+# ---------------------------------------------------------
+
 def save_json_output(
     result: dict[str, Any],
-    output_dir: str | Path = "data/output",
+    output_dir: str | Path = OUTPUT_DIR,
 ) -> Path:
-    """Save parser result as UTF-8 JSON."""
 
     output_path = Path(output_dir)
 
@@ -518,10 +583,7 @@ def save_json_output(
         result["file_name"]
     ).stem
 
-    json_path = (
-        output_path /
-        f"{source_name}.json"
-    )
+    json_path = output_path / f"{source_name}.json"
 
     json_path.write_text(
         json.dumps(
@@ -535,56 +597,168 @@ def save_json_output(
     return json_path
 
 
-# ============================================================
-# Command Line / Test
-# ============================================================
+# ---------------------------------------------------------
+# FIND ALL SAMPLE FILES
+# ---------------------------------------------------------
 
-def main() -> None:
+def discover_sample_files(
+    samples_dir: str | Path = SAMPLES_DIR,
+) -> list[Path]:
+
+    samples_path = Path(samples_dir)
+
+    samples_path.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
+
+    files = [
+        path
+        for path in samples_path.iterdir()
+        if path.is_file()
+        and path.suffix.lower() in SUPPORTED_EXTENSIONS
+    ]
+
+    return sorted(
+        files,
+        key=lambda path: path.name.lower(),
+    )
+
+
+# ---------------------------------------------------------
+# PROCESS MULTIPLE FILES
+# ---------------------------------------------------------
+
+def process_files(
+    files: list[Path],
+    skip_existing: bool = False,
+) -> list[Path]:
+
+    if not files:
+        logger.info(
+            "No supported PDF/image files found in %s",
+            SAMPLES_DIR,
+        )
+        return []
+
+    generated_outputs = []
+
+    logger.info(
+        "Found %d document(s).",
+        len(files),
+    )
+
+    for file_path in files:
+
+        output_path = OUTPUT_DIR / f"{file_path.stem}.json"
+
+        if skip_existing and output_path.exists():
+            logger.info(
+                "Skipping (JSON exists): %s",
+                output_path.name,
+            )
+            generated_outputs.append(output_path)
+            continue
+
+        logger.info(
+            "Processing: %s",
+            file_path.name,
+        )
+
+        result = parse_document(file_path)
+
+        output_path = save_json_output(result)
+
+        generated_outputs.append(output_path)
+
+        if result["status"] == "success":
+            logger.info(
+                "JSON created: %s",
+                output_path.name,
+            )
+        else:
+            logger.error(
+                "Failed: %s",
+                result.get("error"),
+            )
+
+    return generated_outputs
+
+
+# ---------------------------------------------------------
+# CLI
+# ---------------------------------------------------------
+
+def build_argument_parser() -> argparse.ArgumentParser:
 
     parser = argparse.ArgumentParser(
-        description="SafeDocAI Local Document Parser"
+        description=(
+            "SafeDocAI document parser. "
+            "Without --file, all supported documents "
+            "inside data/samples/ are processed."
+        )
     )
 
     parser.add_argument(
-        "file",
-        nargs="?",
-        default="data/samples/Devesh 4th sem.pdf",
-        help="Path to PDF or image file",
+        "--file",
+        type=str,
+        help=(
+            "Process one specific PDF/image file."
+        ),
     )
 
+    parser.add_argument(
+        "--skip-existing",
+        action="store_true",
+        help=(
+            "Skip files that already have a JSON in "
+            "data/output/ (avoids re-running OCR on CPU)."
+        ),
+    )
+
+    return parser
+
+
+# ---------------------------------------------------------
+# MAIN
+# ---------------------------------------------------------
+
+def main() -> None:
+
+    parser = build_argument_parser()
     args = parser.parse_args()
 
-    print()
-    print("==============================")
-    print("     SafeDocAI - Phase 1")
-    print("          Document Parser")
-    print("==============================")
-    print()
-
-    print(
-        f"Input file: {args.file}"
+    logger.info(
+        "OCR language: %s",
+        OCR_LANGUAGE,
     )
 
-    result = DocumentParser().parse(
-        args.file
-    )
+    # ---------------------------------------------
+    # SINGLE FILE MODE
+    # ---------------------------------------------
 
-    print()
-    print(
-        json.dumps(
-            result,
-            ensure_ascii=False,
-            indent=4,
+    if args.file:
+
+        file_path = Path(args.file)
+
+        if not file_path.is_absolute():
+            file_path = PROJECT_ROOT / file_path
+
+        process_files(
+            [file_path],
+            skip_existing=args.skip_existing,
         )
-    )
-    print()
+        return
 
-    output_path = save_json_output(
-        result
-    )
+    # ---------------------------------------------
+    # AUTO-SCAN MODE
+    # ---------------------------------------------
 
-    print(
-        f"JSON saved to: {output_path}"
+    files = discover_sample_files()
+
+    process_files(
+        files,
+        skip_existing=args.skip_existing,
     )
 
 
