@@ -60,7 +60,7 @@ STREAM = False
 JSON_FORMAT = "json"
 
 # Generation caps for CPU-only hardware.
-DEFAULT_NUM_PREDICT = 384
+DEFAULT_NUM_PREDICT = 320
 DEFAULT_TEMPERATURE = 0.0
 
 # Explicit context window (tokens) for the Ollama runner. Setting it
