@@ -62,6 +62,13 @@ from storage_engine import (
     get_db_connection,
 )
 
+from selection_engine import (
+    SelectionUnavailable,
+    attach_evidence,
+    position_aware_merge,
+    select_window,
+)
+
 
 def get_document_id_from_db(file_path: str | Path) -> int | None:
     """Get the SQLite document_id for an original document path."""
@@ -131,6 +138,20 @@ DEFAULT_LLM_WINDOW_OVERLAP_CHARS = 200
 # the text with clearly marked omissions (same contract as
 # llm_engine.build_context) instead of making more calls.
 DEFAULT_MAX_LLM_CALLS_PER_DOCUMENT = 4
+
+# ---------------------------------------------------------------------------
+# Selection-mode configuration (approved "selection instead of transcription")
+# ---------------------------------------------------------------------------
+
+#: Master switch for the candidate-selection path. True = the per-window
+#: pipeline extracts deterministic candidates and the LLM selects ids; any
+#: selection failure falls back to the existing legacy extraction below.
+SELECTION_MODE_ENABLED = True
+
+#: Bounded re-asks per candidate slice before falling back (the approved
+#: retry rule lives in selection_budget.truncation_retry_plan; this only
+#: bounds the outer loop).
+SELECTION_MAX_ATTEMPTS_PER_SLICE = 2
 
 
 # Optional runtime override of the per-document LLM call cap.
@@ -491,6 +512,256 @@ def save_understanding(
     return output_path
 
 
+# ---------------------------------------------------------------------------
+# Selection-mode helpers (approved candidate-selection path)
+# ---------------------------------------------------------------------------
+
+_WINDOW_MARKER_RE = re.compile(r"\[\.\.\..*?\.\.\.\]", re.DOTALL)
+
+
+def _strip_window_markers(window_text: str) -> str:
+    """Remove synthetic omission markers, leaving only real OCR content."""
+    return _WINDOW_MARKER_RE.sub("", window_text)
+
+
+def _window_bounds(
+    windows: list[str],
+    raw_text: str,
+) -> list[tuple[int, int, int]]:
+    """Locate each window's real OCR content as absolute spans.
+
+    Returns ``(window_index, start, end)`` triples. A window whose text
+    contains an omission marker (head+tail join) yields TWO contiguous
+    regions - head and tail - so footer candidates are never silently
+    excluded from candidate extraction.
+
+    Each region is located by matching its first line from a forward cursor
+    and walking its lines to find the end. Slight end imprecision is
+    harmless: candidate spans only need the right [start, end) neighborhood,
+    and position-aware merge collapses genuine cross-window duplicates.
+    """
+    regions: list[tuple[int, int, int]] = []
+    cursor = 0
+    text_length = len(raw_text)
+
+    for window_index, window_text in enumerate(windows, start=1):
+        # Split on omission markers FIRST: each piece is a contiguous region
+        # of the original OCR (head, tail, or a plain single-region window).
+        pieces = [
+            piece.strip()
+            for piece in _WINDOW_MARKER_RE.split(window_text)
+            if piece.strip()
+        ]
+
+        search_from = cursor
+        last_start = cursor
+
+        for piece_index, piece in enumerate(pieces):
+            lines = [ln.strip() for ln in piece.split("\n") if ln.strip()]
+            if not lines:
+                continue
+
+            # Pieces after the first (a joined tail) live near the document
+            # end, far from the running cursor - search the whole text.
+            base = search_from if piece_index == 0 else 0
+
+            probe = lines[0][:120]
+            start = raw_text.find(probe, base)
+            if start < 0:
+                start = raw_text.find(probe)
+            if start < 0:
+                start = base
+
+            # Region end: walk the piece's lines to find where its content
+            # ends (good precision on real, non-repetitive OCR text).
+            pos = start
+            for line in lines:
+                idx = raw_text.find(line, pos)
+                if idx < 0:
+                    break
+                pos = idx + len(line)
+
+            end = min(text_length, max(start + 1, pos))
+            if end > start:
+                regions.append((window_index, max(0, start), end))
+                last_start = start
+
+        # Next window overlaps this one, so its content starts at or after
+        # this window's first matched position (not after its end).
+        cursor = max(0, min(last_start + 1, text_length))
+
+    # Tail-anchor correction: the window builder guarantees the LAST window
+    # ends at the end of the OCR text (head+tail anchoring). Extend the final
+    # region accordingly so footer candidates are never excluded.
+    if regions:
+        region_index, region_start, _ = regions[-1]
+        regions[-1] = (region_index, region_start, text_length)
+
+    return regions
+
+
+def _run_selection_mode(
+    raw_text: str,
+    windows: list[str],
+    heuristic_type: str,
+    model: str,
+) -> tuple[dict[str, Any] | None, list[dict[str, Any]]]:
+    """Run the approved selection pipeline over every window.
+
+    Returns ``(selection_result, call_log)``. ``selection_result`` is None
+    when NO window produced a valid selection (caller falls back to legacy).
+    A single window's failure never destroys the document: remaining windows
+    still contribute, and the failure is reported in the telemetry.
+    """
+    call_log: list[dict[str, Any]] = []
+    window_regions = _window_bounds(windows, raw_text)
+    window_results: list[dict[str, Any]] = []
+    window_stats: list[dict[str, Any]] = []
+
+    doc_type_hint = (
+        heuristic_type if heuristic_type and heuristic_type != "UNKNOWN" else None
+    )
+
+    for window_index, w_start, w_end in window_regions:
+        window_stat: dict[str, Any] = {
+            "window": window_index,
+            "window_start": w_start,
+            "window_end": w_end,
+        }
+
+        try:
+            result = select_window(
+                raw_text,
+                windows[window_index - 1],
+                w_start,
+                w_end,
+                model=model,
+                doc_type_hint=doc_type_hint,
+                call_log=call_log,
+                max_attempts_per_slice=SELECTION_MAX_ATTEMPTS_PER_SLICE,
+            )
+        except SelectionUnavailable as exc:
+            logger.warning(
+                "Selection unavailable for window region %d [%d:%d): %s",
+                window_index,
+                w_start,
+                w_end,
+                exc,
+            )
+            window_stat["status"] = "unusable"
+            window_stat["reason"] = str(exc)
+            window_stats.append(window_stat)
+            continue
+
+        accepted, rejected = attach_evidence(
+            result["selected_fields"], raw_text
+        )
+
+        result["accepted_fields"] = accepted
+        result["rejected_fields"] = rejected
+        result["window_index"] = window_index
+        window_results.append(result)
+
+        window_stat.update(
+            {
+                "status": "ok",
+                "candidate_count": result["candidate_count"],
+                "selected": len(result["selected_fields"]),
+                "accepted": len(accepted),
+                "rejected_span": len(rejected),
+                "plan": result["plan"],
+            }
+        )
+        window_stats.append(window_stat)
+
+    if not window_results:
+        return None, call_log
+
+    merged_fields, merge_info = position_aware_merge(window_results, raw_text)
+
+    # Document type: majority vote across this window's selection calls,
+    # heuristic remains only a downstream cross-check (never authoritative).
+    type_votes: dict[str, int] = {}
+    for result in window_results:
+        for vote in result.get("doc_type_votes", []):
+            vote_clean = str(vote).strip()
+            if vote_clean and vote_clean.upper() not in {
+                "UNKNOWN",
+                "NONE",
+                "N/A",
+            }:
+                type_votes[vote_clean] = type_votes.get(vote_clean, 0) + 1
+
+    chosen_type = ""
+    if type_votes:
+        chosen_type = max(type_votes, key=lambda t: (type_votes[t], len(t)))
+
+    summary_parts: list[str] = []
+    for result in window_results:
+        for part in result.get("summary_parts", []):
+            part_clean = str(part).strip()
+            if part_clean and part_clean not in summary_parts:
+                summary_parts.append(part_clean)
+
+    total_selected = sum(
+        len(r.get("selected_fields", [])) for r in window_results
+    )
+    total_accepted = sum(
+        len(r.get("accepted_fields", [])) for r in window_results
+    )
+    total_rejected = sum(
+        len(r.get("rejected_fields", [])) for r in window_results
+    )
+    failed_windows = sum(
+        1 for s in window_stats if s.get("status") != "ok"
+    )
+
+    valid_calls = [c for c in call_log if c.get("json_valid")]
+    truncated_calls = [
+        c for c in call_log if c.get("done_reason") == "length"
+    ]
+
+    telemetry = {
+        "path": "selection",
+        "windows_total": len(windows),
+        "windows_ok": len(window_results),
+        "windows_unusable": failed_windows,
+        "candidate_counts": [
+            s.get("candidate_count")
+            for s in window_stats
+            if s.get("status") == "ok"
+        ],
+        "selection_calls": len(call_log),
+        "valid_selection_calls": len(valid_calls),
+        "truncated_calls": len(truncated_calls),
+        "calls": call_log,
+        "selected_total": total_selected,
+        "evidence_accepted": total_accepted,
+        "evidence_rejected": total_rejected,
+        "merge": merge_info,
+        "window_stats": window_stats,
+        "type_votes": type_votes,
+    }
+
+    fields_out = [
+        {
+            "key": f["key"],
+            "value": f["value"],
+            "evidence_snippet": f["evidence_snippet"],
+        }
+        for f in merged_fields
+    ]
+
+    selection_result = {
+        "document_type": chosen_type,
+        "summary": " ".join(summary_parts).strip(),
+        "fields": fields_out,
+        "telemetry": telemetry,
+    }
+
+    return selection_result, call_log
+
+
 def process_document(
     json_path: Path,
     model: str = DEFAULT_MODEL,
@@ -555,39 +826,68 @@ def process_document(
         text_length,
     )
 
-    # Step 3: Call LLM for dynamic understanding, per window
+    # Step 3: Document understanding. Preferred path is the approved
+    # candidate-selection architecture (deterministic candidates -> bounded
+    # LLM selection -> post-hoc evidence -> position-aware merge); the
+    # existing legacy transcription path is the fallback and stays intact.
+    selection_result: dict[str, Any] | None = None
+    selection_call_log: list[dict[str, Any]] = []
     window_results: list[dict[str, Any]] = []
     llm_start = time.time()
 
-    for window_index, window_text in enumerate(windows, start=1):
-        logger.info(
-            "LLM window %d/%d: %d chars",
-            window_index,
-            len(windows),
-            len(window_text),
+    if SELECTION_MODE_ENABLED:
+        selection_result, selection_call_log = _run_selection_mode(
+            raw_text,
+            windows,
+            heuristic_type,
+            model,
         )
 
-        window_result = understand_document(
-            window_text,
-            model=model,
-            max_context_chars=max_context_chars,
-            num_predict=num_predict,
-        )
-
-        if window_result.get("error"):
-            logger.warning(
-                "LLM window %d failed for %s: %s",
-                window_index,
+    if selection_result is not None:
+        llm_result = {
+            "document_type": selection_result["document_type"],
+            "summary": selection_result["summary"],
+            "fields": selection_result["fields"],
+            "error": None,
+        }
+        llm_time = time.time() - llm_start
+    else:
+        if SELECTION_MODE_ENABLED:
+            logger.info(
+                "Selection path unavailable for %s; falling back to "
+                "legacy extraction.",
                 json_path.name,
-                window_result.get("error"),
             )
-            continue
 
-        window_results.append(window_result)
+        for window_index, window_text in enumerate(windows, start=1):
+            logger.info(
+                "LLM window %d/%d: %d chars",
+                window_index,
+                len(windows),
+                len(window_text),
+            )
 
-    llm_time = time.time() - llm_start
+            window_result = understand_document(
+                window_text,
+                model=model,
+                max_context_chars=max_context_chars,
+                num_predict=num_predict,
+            )
 
-    if not window_results:
+            if window_result.get("error"):
+                logger.warning(
+                    "LLM window %d failed for %s: %s",
+                    window_index,
+                    json_path.name,
+                    window_result.get("error"),
+                )
+                continue
+
+            window_results.append(window_result)
+
+        llm_time = time.time() - llm_start
+
+    if selection_result is None and not window_results:
         logger.error("All LLM windows failed for %s", json_path.name)
 
         if heuristic_type != "UNKNOWN":
@@ -672,14 +972,16 @@ def process_document(
         return final_understanding
 
 
-    # Merge window results before downstream validation
-    merged = _merge_llm_windows(window_results, raw_text)
-    llm_result = {
-        "document_type": merged["document_type"],
-        "summary": merged["summary"],
-        "fields": merged["fields"],
-        "error": None,
-    }
+    # Merge window results before downstream validation (legacy path only;
+    # the selection path already merged position-aware).
+    if selection_result is None:
+        merged = _merge_llm_windows(window_results, raw_text)
+        llm_result = {
+            "document_type": merged["document_type"],
+            "summary": merged["summary"],
+            "fields": merged["fields"],
+            "error": None,
+        }
 
     if llm_result.get("error"):
         logger.error(
@@ -795,6 +1097,14 @@ def process_document(
             "total_time_seconds": round(time.time() - start_time, 3),
         },
     }
+
+    # Selection-path telemetry: full provenance of every selection call
+    # (eval_count, done_reason, latency, JSON validity) and the rejected-
+    # evidence audit trail. The legacy path simply omits this block.
+    if selection_result is not None:
+        final_understanding["selection_telemetry"] = selection_result[
+            "telemetry"
+        ]
 
     # Add error info if present
     if llm_result.get("error"):

@@ -537,6 +537,400 @@ def understand_document(
 
 
 # ============================================================
+# Selection mode ("selection instead of transcription")
+# ============================================================
+#
+# The transcription path above asks the model to re-type fields and
+# evidence snippets. The selection path instead hands the model a
+# deterministic candidate list (from candidate_extractor) and asks it
+# to SELECT relevant candidate ids. Values are never transcribed by
+# the model: the caller verifies each selection against the exact
+# candidate record and derives evidence post-hoc from char_span.
+
+#: Compact output contract for selection calls (keys deliberately short
+#: so a K-sized response stays far inside the approved num_predict).
+_SELECTION_SCHEMA_REMINDER = (
+    'Respond ONLY with JSON: '
+    '{"s":[{"i":<candidate id>,"k":"<max 3 words>","v":"<max 36 chars>"}],'
+    '"t":"document type","m":"brief meaning"}'
+)
+
+
+def build_selection_prompt(
+    window_text: str,
+    candidates: list[dict[str, Any]],
+    doc_type_hint: str | None = None,
+    max_selections: int | None = None,
+) -> str:
+    """Build the selection-mode prompt for one bounded OCR window.
+
+    Args:
+        window_text: The bounded OCR window (already windowed upstream).
+        candidates: Candidate dicts with keys ``id``, ``label``, ``value``
+            (schema of candidate_extractor.Candidate.to_dict). ``line_no``
+            and ``char_span`` are deliberately NOT shown to the model.
+        doc_type_hint: Optional heuristic document type (hint only, never
+            authoritative; omit or pass UNKNOWN freely).
+        max_selections: Optional planner K for this call; stated to the
+            model so the selection count stays within the plan.
+
+    Returns:
+        Prompt string. The candidate ids/labels/values and the OCR window
+        are always included; the type hint only when available.
+    """
+
+    lines: list[str] = []
+
+    lines.append(
+        "You are a Document Analyst. Below are OCR text and numbered "
+        "candidate fields found in it."
+    )
+    lines.append("")
+    lines.append("Rules:")
+    lines.append("- Select ONLY candidate ids that hold important document data.")
+    lines.append("- i MUST be an existing candidate id from the list. Never invent ids.")
+    lines.append("- v MUST copy that candidate's value. Never invent or change values.")
+    lines.append("- k: short label, max 3 words. v: max 36 characters.")
+    lines.append("- No evidence snippets. No keys outside the schema.")
+    if max_selections is not None:
+        lines.append(f"- Select at most {int(max_selections)} candidates.")
+    else:
+        lines.append("- Select only as many candidates as are relevant.")
+    if doc_type_hint and str(doc_type_hint).strip().upper() not in {
+        "",
+        "UNKNOWN",
+    }:
+        lines.append(
+            f"- Likely document type (hint only, verify from text): {doc_type_hint}"
+        )
+    lines.append(_SELECTION_SCHEMA_REMINDER)
+
+    lines.append("")
+    lines.append("Candidates:")
+    for cand in candidates:
+        lines.append(
+            f"{cand.get('id')}. {cand.get('label', '')}: {cand.get('value', '')}"
+        )
+
+    lines.append("")
+    lines.append("OCR text:")
+    lines.append(window_text)
+
+    return "\n".join(lines)
+
+
+class SelectionParseResult:
+    """Outcome of defensively parsing one selection response.
+
+    ``ok`` is True only for a complete, valid, schema-conforming response.
+    Any malformed/truncated/over-limit response sets ``ok=False`` with a
+    ``reason``; the caller must then retry or fall back. Truncated JSON is
+    NEVER partially accepted.
+    """
+
+    __slots__ = (
+        "ok",
+        "reason",
+        "selections",
+        "document_type",
+        "summary",
+        "rejected_reasons",
+        "repairs",
+    )
+
+    def __init__(
+        self,
+        ok: bool,
+        reason: str = "",
+        selections: list[dict[str, Any]] | None = None,
+        document_type: str = "",
+        summary: str = "",
+        rejected_reasons: list[str] | None = None,
+        repairs: list[str] | None = None,
+    ) -> None:
+        self.ok = ok
+        self.reason = reason
+        self.selections = selections or []
+        self.document_type = document_type
+        self.summary = summary
+        self.rejected_reasons = rejected_reasons or []
+        self.repairs = repairs or []
+
+
+def _values_consistent(candidate_value: str, model_value: str) -> bool:
+    """True when the model's echoed value is faithful to the candidate.
+
+    Either an exact match or a prefix of the candidate value (the compact
+    schema asks the model to clip values to 36 characters; long identifiers
+    such as enrollment numbers arrive clipped). The candidate value always
+    stays the authoritative one.
+    """
+    if not candidate_value or not model_value:
+        return False
+    return model_value == candidate_value or candidate_value.startswith(
+        model_value
+    )
+
+
+def parse_selection_response(
+    response_text: str | None,
+    id_to_candidate: dict[int, dict[str, Any]],
+    *,
+    max_selections: int,
+) -> SelectionParseResult:
+    """Defensively parse and validate a selection-mode response.
+
+    Validation (all must pass, else ok=False):
+    - JSON parses as a complete object (truncated JSON is rejected whole).
+    - Every selection has an integer ``i`` that exists in id_to_candidate.
+    - ``v`` matches the candidate's value (exact, or a prefix of it -- the
+      model may clip long values to 36 chars; the CANDIDATE value is then
+      used as authoritative, so no value is ever invented).
+    - Selection count <= max_selections (the planned K). Unknown ids,
+      malformed entries, and over-K responses are rejected as a whole.
+    - ``k`` is trimmed to at most 3 words (defensive; the candidate label
+      remains available for evidence).
+
+    Args:
+        response_text: Raw model output (JSON-forced).
+        id_to_candidate: Mapping of candidate id -> candidate dict.
+        max_selections: Planned K for this call.
+    """
+
+    if not response_text or not response_text.strip():
+        return SelectionParseResult(False, reason="empty response")
+
+    parsed = extract_json(response_text)
+
+    if parsed is None:
+        return SelectionParseResult(
+            False, reason="invalid or truncated JSON"
+        )
+
+    raw_selections = parsed.get("s")
+    if not isinstance(raw_selections, list):
+        return SelectionParseResult(
+            False, reason="missing or non-list 's'"
+        )
+
+    if len(raw_selections) > max_selections:
+        return SelectionParseResult(
+            False,
+            reason=(
+                f"{len(raw_selections)} selections exceeds planned K="
+                f"{max_selections}"
+            ),
+        )
+
+    selections: list[dict[str, Any]] = []
+    rejected_entries: list[str] = []
+    repairs: list[str] = []
+    claimed_ids: set[int] = set()
+
+    for entry in raw_selections:
+        if not isinstance(entry, dict):
+            rejected_entries.append("non-object selection entry")
+            continue
+
+        raw_id = entry.get("i")
+
+        # bool is a subclass of int; exclude it explicitly. Digit-string and
+        # integral-float ids ("1" / 1.0 -- common JSON-forced model quirks)
+        # are safely coerced BEFORE lookup: the id must still exist in the
+        # candidate map and its value must still match, so coercion can never
+        # invent a selection. Truly malformed ids are rejected.
+        if isinstance(raw_id, bool):
+            rejected_entries.append(
+                f"non-integer candidate id: {raw_id!r}"
+            )
+            continue
+
+        if isinstance(raw_id, int):
+            candidate_id = raw_id
+        elif isinstance(raw_id, float) and float(raw_id).is_integer():
+            candidate_id = int(raw_id)
+        elif isinstance(raw_id, str) and raw_id.strip().isdigit():
+            candidate_id = int(raw_id.strip())
+        else:
+            rejected_entries.append(
+                f"non-integer candidate id: {raw_id!r}"
+            )
+            continue
+
+        model_value = str(entry.get("v", "")).strip()
+
+        if not model_value:
+            rejected_entries.append(
+                f"empty value for candidate id {raw_id}"
+            )
+            continue
+
+        claimed = id_to_candidate.get(candidate_id)
+        claimed_value = "" if claimed is None else str(claimed.get("value", "")).strip()
+
+        if claimed is not None and _values_consistent(claimed_value, model_value):
+            final_id = candidate_id
+        else:
+            # The model mispaired id and value (observed on real qwen2.5:3b
+            # output: 1-based ids against the 0-based candidate list, so
+            # every value belongs to the neighbouring candidate). The VALUE
+            # is the authoritative anchor, so the entry is re-paired only
+            # when exactly ONE offered candidate carries a consistent value;
+            # ambiguous or unmatched values are rejected. This never invents
+            # a value and never re-pairs silently (repairs are reported).
+            matching_ids: list[int] = [
+                cand_id
+                for cand_id, cand in id_to_candidate.items()
+                if _values_consistent(
+                    str(cand.get("value", "")).strip(), model_value
+                )
+            ]
+            unique_match: int | None = (
+                matching_ids[0] if len(matching_ids) == 1 else None
+            )
+
+            if unique_match is None:
+                if claimed is None:
+                    if matching_ids:
+                        rejected_entries.append(
+                            f"unknown candidate id {raw_id}: model said "
+                            f"{model_value!r}, which matches "
+                            f"{len(matching_ids)} offered candidates "
+                            f"ambiguously"
+                        )
+                    else:
+                        rejected_entries.append(
+                            f"unknown candidate id {raw_id}: model said "
+                            f"{model_value!r}, which matches no offered candidate"
+                        )
+                else:
+                    rejected_entries.append(
+                        f"value mismatch for candidate id {raw_id}: "
+                        f"model said {model_value!r}, candidate is "
+                        f"{claimed_value!r}"
+                    )
+                continue
+
+            repairs.append(f"claimed id {raw_id} -> candidate {unique_match}")
+            final_id = unique_match
+            claimed = id_to_candidate[final_id]
+            claimed_value = str(claimed.get("value", "")).strip()
+
+        if final_id in claimed_ids:
+            rejected_entries.append(
+                f"duplicate selection of candidate id {final_id}"
+            )
+            continue
+
+        claimed_ids.add(final_id)
+        candidate = claimed
+        candidate_value = claimed_value
+
+        # Defensive k normalization: max 3 words. The authoritative label
+        # for evidence remains the candidate's own label.
+        key_words = str(entry.get("k", "")).split()
+        key = " ".join(key_words[:3]).strip()
+
+        if not key:
+            key = str(candidate.get("label", "")).strip()
+
+        selections.append(
+            {
+                "id": final_id,
+                "key": key,
+                "value": candidate_value,
+                "line_no": candidate.get("line_no"),
+                "char_span": candidate.get("char_span"),
+            }
+        )
+
+    # A response whose EVERY entry was rejected is a failed response (the
+    # model produced nothing trustworthy); the caller retries or falls back.
+    # A mixed response keeps only its verified selections; the rejections
+    # are reported in ``rejected_reasons`` for telemetry, never stored.
+    if not selections and rejected_entries:
+        return SelectionParseResult(
+            False,
+            reason="; ".join(rejected_entries[:3]),
+        )
+
+    document_type = str(parsed.get("t", "")).strip()
+    summary = str(parsed.get("m", "")).strip()
+
+    return SelectionParseResult(
+        True,
+        selections=selections,
+        document_type=document_type,
+        summary=summary,
+        rejected_reasons=rejected_entries,
+        repairs=repairs,
+    )
+
+
+def generate_with_meta(
+    prompt: str,
+    *,
+    model: str = DEFAULT_MODEL,
+    num_predict: int = DEFAULT_NUM_PREDICT,
+    temperature: float = DEFAULT_TEMPERATURE,
+    num_ctx: int = DEFAULT_NUM_CTX,
+) -> dict[str, Any] | None:
+    """Like :func:`generate` but also reports done_reason and token usage.
+
+    Returns ``{"text", "done_reason", "eval_count", "latency_seconds"}``
+    or None on transport failure. done_reason is what Ollama reported
+    ("stop" normally, "length" when num_predict truncated the output) and
+    drives the selection path's truncation retry decision.
+    """
+
+    payload = {
+        "model": model,
+        "prompt": prompt,
+        "stream": STREAM,
+        "format": JSON_FORMAT,
+        "options": {
+            "num_predict": num_predict,
+            "temperature": temperature,
+            "num_ctx": num_ctx,
+        },
+    }
+
+    start = time.time()
+
+    try:
+        response = requests.post(
+            GENERATE_URL,
+            json=payload,
+            timeout=REQUEST_TIMEOUT,
+        )
+
+        response.raise_for_status()
+
+    except requests.exceptions.RequestException as exc:
+        logger.error("Ollama selection request failed: %s", exc)
+        return None
+
+    except Exception as exc:  # defensive - never crash
+        logger.error("Unexpected Ollama selection error: %s", exc)
+        return None
+
+    try:
+        body = response.json() or {}
+    except ValueError:
+        logger.error("Ollama returned a non-JSON body.")
+        return None
+
+    response_text = str(body.get("response", "")).strip()
+
+    return {
+        "text": response_text,
+        "done_reason": body.get("done_reason"),
+        "eval_count": body.get("eval_count"),
+        "latency_seconds": round(time.time() - start, 3),
+    }
+
+
+# ============================================================
 # Module test
 # ============================================================
 
