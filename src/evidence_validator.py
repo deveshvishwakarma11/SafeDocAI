@@ -379,25 +379,6 @@ def _flexible_match_in_text(value_normalized: str, evidence_normalized: str) -> 
         return False
 
 
-def _similar_enough(str1: str, str2: str, max_diff: int = 1) -> bool:
-    """
-    Check if two strings are similar enough (within max_diff character changes).
-    
-    This is a simple helper for fuzzy matching. For production use,
-    consider using a proper fuzzy matching library.
-    """
-    if len(str1) != len(str2):
-        return False
-    
-    diff_count = 0
-    for c1, c2 in zip(str1, str2):
-        if c1 != c2:
-            diff_count += 1
-            if diff_count > max_diff:
-                return False
-    
-    return diff_count <= max_diff
-
 
 def validate_fields(
     fields: list[dict[str, Any]],

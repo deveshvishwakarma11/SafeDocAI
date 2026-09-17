@@ -34,7 +34,6 @@ import re
 from typing import Any
 
 from candidate_extractor import (
-    Candidate,
     extract_candidates_for_window_with_stats,
     has_usable_candidates,
 )

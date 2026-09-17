@@ -106,6 +106,23 @@ class _StreamlitHarness:
         self._patcher.stop()
 
     def text_of(self, method: str) -> str:
+        # "expander" is a context-manager marker in the flat recorder:
+        # return everything recorded AFTER the first expander() call
+        # (its collapsed content), regardless of the inner method.
+        if method == "expander":
+            calls = self.recorded.calls
+            start = next(
+                (i for i, (name, _a, _k) in enumerate(calls) if name == "expander"),
+                None,
+            )
+            if start is None:
+                return ""
+            chunks = [
+                args[0]
+                for name, args, _kwargs in calls[start + 1 :]
+                if args and isinstance(args[0], str)
+            ]
+            return "\n".join(chunks)
         chunks = []
         for name, args, _kwargs in self.recorded.calls:
             if name == method and args and isinstance(args[0], str):
@@ -200,10 +217,12 @@ class TestRenderResult(unittest.TestCase):
         with harness, mock.patch.object(ui, "answer_query", return_value=make_result()):
             render_result(build_payload("What is my roll number?"))
         self.assertIn("2407510100067", harness.text_of("markdown"))
+        # Phase 9: compact main view — file name in the Source line, the
+        # detailed field/value provenance hidden in the expander.
         self.assertIn("ID Card.pdf", harness.text_of("markdown"))
-        self.assertIn("roll", harness.text_of("markdown"))
+        self.assertIn("roll", harness.text_of("expander"))
         self.assertIn("Grounded: Yes", harness.text_of("caption"))
-        self.assertIn("Exact match", harness.text_of("caption"))
+        self.assertIn("Exact match", harness.text_of("expander"))
 
     def test_11_semantic_display_shows_chunks_and_llm(self):
         result = make_result(
@@ -219,9 +238,9 @@ class TestRenderResult(unittest.TestCase):
         with harness, mock.patch.object(ui, "answer_query", return_value=result):
             render_result(build_payload("q"))
         self.assertIn("Grounded: Yes", harness.text_of("caption"))
-        self.assertIn("Local AI used: Yes", harness.text_of("caption"))
+        # Phase 9: chunk internals live in the collapsed Details expander.
+        self.assertIn("chunk 3", harness.text_of("expander"))
         self.assertIn("4143027140.pdf", harness.text_of("markdown"))
-        self.assertIn("chunk 3", harness.text_of("caption"))
 
     def test_12_fallback_display_is_human_readable(self):
         result = make_result(

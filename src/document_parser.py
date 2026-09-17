@@ -4,12 +4,10 @@ import argparse
 import json
 import logging
 import re
-import string
 import unicodedata
 from pathlib import Path
 from typing import Any
 
-import cv2
 import numpy as np
 import pdfplumber
 import pytesseract

@@ -14,8 +14,6 @@ It does NOT try to be a full semantic chunker. It focuses on:
 from __future__ import annotations
 
 import re
-from typing import Any
-
 from typing import Sequence
 
 

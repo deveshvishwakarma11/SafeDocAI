@@ -27,25 +27,16 @@ import time
 from pathlib import Path
 from typing import Any
 
-from chunker import (
-    chunk_text_safe,
-    chunk_windows,
-    score_chunk_relevance,
-    select_relevant_windows,
-)
-
 from llm_engine import (
     DEFAULT_MAX_CONTEXT_CHARS,
     DEFAULT_MODEL,
     DEFAULT_NUM_PREDICT,
-    build_prompt,
     health_check,
     is_model_available,
     understand_document,
 )
 
 from heuristics import (
-    classify_document,
     get_document_type_confidence,
     is_high_confidence_classification,
 )

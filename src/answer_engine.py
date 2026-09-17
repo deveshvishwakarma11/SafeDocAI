@@ -37,10 +37,24 @@ import time
 from typing import Any
 
 try:  # src/ on sys.path (pipeline style)
-    from llm_engine import extract_json, generate_with_meta, health_check
+    from language import (
+        LANG_ENGLISH,
+        LANG_HINGLISH,
+        LANG_HINDI,
+        detect_language,
+    )
+    from llm_engine import extract_json, generate_with_meta
+    from query_relevance import check_query_relevance
     from query_router import route_query
 except ImportError:  # project root on sys.path (test/tooling style)
-    from src.llm_engine import extract_json, generate_with_meta, health_check
+    from src.language import (
+        LANG_ENGLISH,
+        LANG_HINGLISH,
+        LANG_HINDI,
+        detect_language,
+    )
+    from src.llm_engine import extract_json, generate_with_meta
+    from src.query_relevance import check_query_relevance
     from src.query_router import route_query
 
 
@@ -68,6 +82,81 @@ INSUFFICIENT_CONTEXT_MESSAGE = (
 #: Output cap for the local model. The schema is one short prose answer
 #: plus a tiny sources array; 256 tokens is ample headroom on CPU.
 ANSWER_NUM_PREDICT = 256
+
+# ------------------------------------------------------------
+# Phase 8: language-aware fixed strings (deterministic, no LLM).
+# Document VALUES are never translated -- only the connective wording
+# around them changes with the user's detected language.
+# ------------------------------------------------------------
+
+#: Insufficient-context message per detected language.
+INSUFFICIENT_CONTEXT_BY_LANGUAGE: dict[str, str] = {
+    LANG_ENGLISH: INSUFFICIENT_CONTEXT_MESSAGE,
+    LANG_HINGLISH: (
+        "Aapke stored documents mein is sawal ka jawab nahi mila."
+    ),
+    LANG_HINDI: (
+        "आपके stored documents में इस सवाल का जवाब नहीं मिला।"
+    ),
+}
+
+#: Single-value exact answer templates: field/value/source stay verbatim.
+_EXACT_SINGLE_SUFFIX = {
+    LANG_ENGLISH: " (from {file_name})",
+    LANG_HINGLISH: " ({file_name} se)",
+    LANG_HINDI: " ({file_name} से)",
+}
+
+#: Multi-value exact answer headers.
+_EXACT_MULTI_HEADER = {
+    LANG_ENGLISH: "Found matching values:",
+    LANG_HINGLISH: "Yeh matching values mili:",
+    LANG_HINDI: "ये matching values मिलीं:",
+}
+
+# ------------------------------------------------------------
+# Phase 9: answer-focused phrasing. The user sees the FACT, not the
+# raw "field: value" row. Values/identifiers stay verbatim.
+# ------------------------------------------------------------
+
+#: Single-value sentence templates. {subject} = the cleaned requested-
+#: fact phrase ("roll number"), {value} = the grounded value verbatim.
+_EXACT_SINGLE_SENTENCE = {
+    LANG_ENGLISH: "Your {subject} is {value}.",
+    LANG_HINGLISH: "Aapka {subject} {value} hai.",
+    LANG_HINDI: "आपका {subject} {value} है।",
+}
+
+#: Multi-value templates. {count} = number of distinct values,
+#: {subject} = requested-fact phrase.
+_EXACT_MULTI_INTRO = {
+    LANG_ENGLISH: "I found {count} matching values for {subject}:",
+    LANG_HINGLISH: "Mujhe {count} {subject} values mili:",
+    LANG_HINDI: "मुझे {count} {subject} values मिलीं:",
+}
+
+#: Edge fillers stripped from the requested-fact phrase (question words
+#: and Hinglish postpositions; deterministic, language-level).
+_SUBJECT_EDGE_FILLERS = frozenset(
+    {
+        "my", "the", "a", "an", "my?", "kya", "hai", "hain", "tha", "thi",
+        "batao", "bata", "bataiye", "ka", "ki", "ke", "mein", "me", "par",
+        "in", "on", "of", "please", "what", "which",
+    }
+)
+
+
+def _clean_subject(hint: str | None, fallback: str | None) -> str:
+    """Deterministic requested-fact phrase for answer-focused phrasing."""
+
+    tokens = re.findall(r"[a-z0-9 .&'/\-]+", str(hint or "").lower())
+    words = (tokens[0] if tokens else "").split()
+    while words and words[0] in _SUBJECT_EDGE_FILLERS:
+        words.pop(0)
+    while words and words[-1] in _SUBJECT_EDGE_FILLERS:
+        words.pop()
+    subject = " ".join(words).strip()
+    return subject or str(fallback or "value")
 
 #: Hard cap on the context length handed to the model (characters). The
 #: router already returns bounded chunks; this is a defensive second cap.
@@ -218,11 +307,19 @@ def build_answer_from_exact(result: dict[str, Any]) -> dict[str, Any]:
 
     Multiple matching values are ALL preserved with their source documents
     (never collapsed, never arbitrarily chosen). No LLM is involved.
+
+    Phase 8: the connective wording follows the user's DETECTED language
+    (English / Hinglish / Hindi); document VALUES stay verbatim.
     """
 
     rows = result.get("results", [])
+    language = detect_language(str(result.get("query") or ""))
+    if language not in _EXACT_MULTI_HEADER:  # unknown/missing query -> English
+        language = LANG_ENGLISH
+
     sources: list[dict[str, Any]] = []
-    lines: list[str] = []
+    seen_display: set[tuple[str, str]] = set()
+    bullets: list[str] = []
 
     for row in rows:
         document_id = row.get("document_id")
@@ -240,21 +337,38 @@ def build_answer_from_exact(result: dict[str, Any]) -> dict[str, Any]:
         if source not in sources:
             sources.append(source)
 
-        lines.append(f"{field_name}: {field_value} (from {file_name})")
+        # Display de-duplication: the SAME value from the SAME document
+        # (e.g. an OCR field stored twice) appears once. Different values
+        # and/or different documents are all kept (never collapsed).
+        key = (str(field_value).strip().lower(), str(file_name))
+        if key in seen_display:
+            continue
+        seen_display.add(key)
+        bullets.append(f"• {field_value} — {file_name}")
 
-    if len(rows) == 1:
-        row = rows[0]
-        answer = f"{row.get('field_name')}: {row.get('field_value')}"
-        if len(sources) > 1:
-            answer += f" (from {sources[0]['file_name']})"
-    elif rows:
-        answer = "Found matching values:\n" + "\n".join(lines)
+    subject = _clean_subject(
+        result.get("field_hint"),
+        rows[0].get("field_name") if rows else None,
+    )
+
+    if len(bullets) == 1:
+        value = str(rows[0].get("field_value"))
+        answer = _EXACT_SINGLE_SENTENCE[language].format(
+            subject=subject, value=value
+        )
+    elif bullets:
+        answer = _EXACT_MULTI_INTRO[language].format(
+            count=len(bullets), subject=subject
+        ) + "\n" + "\n".join(bullets)
     else:
-        answer = INSUFFICIENT_CONTEXT_MESSAGE
+        answer = INSUFFICIENT_CONTEXT_BY_LANGUAGE.get(
+            language, INSUFFICIENT_CONTEXT_MESSAGE
+        )
 
     return {
         "query": result.get("query"),
         "answer": answer,
+        "language": language,
         "sources": sources,
         "source_documents": [
             {"document_id": s["document_id"], "file_name": s["file_name"]}
@@ -274,13 +388,77 @@ def build_answer_from_exact(result: dict[str, Any]) -> dict[str, Any]:
 # ============================================================
 
 
-def build_semantic_prompt(question: str, chunks: list[dict[str, Any]]) -> str:
+# ------------------------------------------------------------
+# Phase 9: answer-length styles. A fact lookup ("What is my transaction
+# ID?") must produce ONE short sentence; a summary/explanation request
+# ("What does my railway ticket contain?") may produce a concise
+# paragraph. Deterministic cue matching decides the style -- never the
+# LLM.
+# ------------------------------------------------------------
+
+#: Cues that mark an explicit summary/explanation request (EN + Hinglish).
+_SUMMARY_CUES: tuple[re.Pattern[str], ...] = tuple(
+    re.compile(pattern, re.IGNORECASE)
+    for pattern in (
+        r"\bsummar(y|ise|ize)\b",
+        r"\bexplain\b",
+        r"\bwhat does\b[^?]*\b(says?|contain(s|ed)?|state(s|d)?)\b",
+        r"\btell me (about|what)\b",
+        r"\bimportant (details|information|points)\b",
+        r"\bke baare\b",
+        r"\bbaare (mein|me)\b",
+        r"\b(kya|kaisa|kaisi) likha\b",
+        r"\bmujhe\b[^?]*\bbata\w*\b",
+        r"\bkya details\b",
+        r"\bwhat is (this|the) document\b",
+        r"\bwhat (information|details) (is|are)\b",
+        r"\bdocument (about|contains)\b",
+        r"\bshow me the (summary|overview|details)\b",
+        r"\b(brief|short) (note|description|overview)\b",
+    )
+)
+
+#: Prompt length rules per style.
+_LENGTH_RULE_FACT = (
+    "- The user asked for a specific fact. Answer with ONE short sentence "
+    "containing ONLY the requested value(s). Do not describe the document, "
+    "do not add background, and do not list unrelated details."
+)
+_LENGTH_RULE_SUMMARY = (
+    "- The user asked for an overview/summary. Give a concise paragraph "
+    "(max 4 sentences)."
+)
+
+
+def is_summary_request(question: str) -> bool:
+    """Deterministically decide fact vs summary/explanation intent."""
+
+    text = str(question or "")
+    return any(pattern.search(text) for pattern in _SUMMARY_CUES)
+
+
+def build_semantic_prompt(
+    question: str,
+    chunks: list[dict[str, Any]],
+    language: str | None = None,
+    style: str | None = None,
+) -> str:
     """Build the strict grounded-QA prompt from retrieved chunks.
 
     The prompt states the contract explicitly: answer ONLY from the
     supplied context, never invent facts, preserve identifiers exactly,
     say when the context is insufficient, and cite sources in the
     structured output.
+
+    Phase 8: when ``language`` is provided, one deterministic extra rule
+    pins the answer language to the user's detected language (Hinglish
+    queries get natural Hinglish, Hindi gets Hindi). The document VALUES
+    are explicitly excluded from translation. ``language=None`` keeps the
+    original English-only prompt byte-identical (backward compatible).
+
+    Phase 9: ``style`` selects the answer-length rule ("fact" = one
+    short sentence with only the requested value; "summary" = concise
+    paragraph). ``None`` auto-detects from the question deterministically.
     """
 
     numbered_chunks = "\n\n".join(
@@ -294,6 +472,26 @@ def build_semantic_prompt(question: str, chunks: list[dict[str, Any]]) -> str:
         for index, chunk in enumerate(chunks)
     )
 
+    if style not in {"fact", "summary"}:
+        style = "summary" if is_summary_request(question) else "fact"
+    length_rule = _LENGTH_RULE_SUMMARY if style == "summary" else _LENGTH_RULE_FACT
+
+    language_rule = ""
+    if language == LANG_HINGLISH:
+        language_rule = (
+            "- The user asked in Hinglish (Roman Hindi mixed with English). "
+            "Write the answer in natural conversational Hinglish (e.g. "
+            "'Aapka roll number 12345 hai.'), not in formal English.\n"
+        )
+    elif language == LANG_HINDI:
+        language_rule = (
+            "- The user asked in Hindi. Write the answer in Hindi "
+            "(Devanagari script), keeping English technical terms/identifiers "
+            "as they appear in the context.\n"
+        )
+    elif language == LANG_ENGLISH:
+        language_rule = "- Write the answer in English.\n"
+
     return f"""You are a document question-answering assistant.
 
 Rules:
@@ -301,7 +499,8 @@ Rules:
 - Never invent facts, numbers, names or identifiers.
 - Copy important identifiers, numbers and dates EXACTLY as they appear.
 - If the context does not contain the answer, say so explicitly.
-- Answer the question directly and concisely (max 4 sentences).
+{length_rule}
+{language_rule}- Do NOT translate document names, identifiers, numbers or values; keep them exactly as in the context.
 - Cite the source document(s) you used in the sources array.
 
 Respond ONLY with JSON:
@@ -394,11 +593,20 @@ def _generate_semantic_answer(
     Transport failure, invalid JSON, truncation (done_reason == "length")
     and grounding failure all return None; callers treat that as
     insufficient rather than storing a guess.
+
+    Phase 8: the user's language is detected deterministically (never by
+    the LLM) and pinned in the prompt so the answer arrives in the
+    language the question was asked in.
     """
 
     context_text = _build_context_text(chunks)[:MAX_CONTEXT_CHARS]
 
-    prompt = build_semantic_prompt(question, chunks)
+    prompt = build_semantic_prompt(
+        question,
+        chunks,
+        language=detect_language(question),
+        style="summary" if is_summary_request(question) else "fact",
+    )
 
     meta = generate_with_meta(
         prompt,
@@ -480,12 +688,47 @@ def answer_query(
 
     started = time.perf_counter()
 
+    # ---- Phase 9: relevance gate ---------------------------------------
+    # Deterministic pre-check BEFORE any retrieval/LLM work. Unrelated
+    # queries (weather, general knowledge, math, jokes, coding) short-
+    # circuit here with zero SQLite/Chroma/Ollama cost.
+    gate = check_query_relevance(query)
+    if not gate["related"]:
+        language = detect_language(query)
+        gate_ms = round((time.perf_counter() - started) * 1000, 3)
+        return {
+            "query": query,
+            "answer": INSUFFICIENT_CONTEXT_BY_LANGUAGE.get(
+                language, INSUFFICIENT_CONTEXT_MESSAGE
+            ),
+            "sources": [],
+            "source_documents": [],
+            "retrieval_route": "none",
+            "classification": "rejected",
+            "fallback": {"occurred": False, "reason": None},
+            "grounded": False,
+            "llm_called": False,
+            "insufficient": True,
+            "retrieval_performed": False,
+            "reason": gate["reason"],
+            "relevance": gate,
+            "language": language,
+            "timings_ms": {
+                "router": 0.0,
+                "retrieval": None,
+                "llm_generation": None,
+                "total": gate_ms,
+            },
+        }
+
     route_result = route_query(query, top_k=top_k, max_distance=max_distance)
 
     router_ms = round((time.perf_counter() - started) * 1000, 3)
 
     if route_result["route"] == "exact":
         payload = build_answer_from_exact(route_result)
+        payload["retrieval_performed"] = True
+        payload["reason"] = "document_related"
         payload["timings_ms"] = {
             "router": router_ms,
             "retrieval": route_result.get("timings_ms", {}).get("retrieval"),
@@ -495,15 +738,21 @@ def answer_query(
         return payload
 
     chunks = route_result.get("results", [])
+    language = detect_language(query)
 
     if not chunks:
         return _public_payload(
-            INSUFFICIENT_CONTEXT_MESSAGE,
+            INSUFFICIENT_CONTEXT_BY_LANGUAGE.get(
+                language, INSUFFICIENT_CONTEXT_MESSAGE
+            ),
             [],
             route_result,
             grounded=False,
             llm_called=False,
             extra={
+                "language": language,
+                "retrieval_performed": True,
+                "reason": "document_related",
                 "insufficient_reason": route_result.get("insufficient_reason"),
                 "timings_ms": {
                     "router": router_ms,
@@ -525,12 +774,15 @@ def answer_query(
 
     if validated is None:
         return _public_payload(
-            INSUFFICIENT_CONTEXT_MESSAGE,
+            INSUFFICIENT_CONTEXT_BY_LANGUAGE.get(
+                language, INSUFFICIENT_CONTEXT_MESSAGE
+            ),
             [],
             route_result,
             grounded=False,
             llm_called=True,
             extra={
+                "language": language,
                 "insufficient_reason": (
                     "the local model's answer could not be validated against "
                     "the retrieved context"
@@ -575,6 +827,9 @@ def answer_query(
         grounded=True,
         llm_called=True,
         extra={
+            "language": language,
+            "retrieval_performed": True,
+            "reason": "document_related",
             "model_confidence": validated.get("model_confidence"),
             "grounding": validated.get("grounding"),
             "unknown_sources": validated.get("unknown_sources", []),

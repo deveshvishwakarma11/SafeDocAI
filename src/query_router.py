@@ -38,12 +38,14 @@ import time
 from typing import Any
 
 try:  # src/ on sys.path (pipeline style)
+    from language import transliterate_for_matching
     from storage_engine import (
         get_chroma_collection,
         get_db_connection,
         get_embedding_model,
     )
 except ImportError:  # project root on sys.path (test/tooling style)
+    from src.language import transliterate_for_matching
     from src.storage_engine import (
         get_chroma_collection,
         get_db_connection,
@@ -120,7 +122,14 @@ _DOCUMENT_HEAD_ENDINGS: tuple[str, ...] = (
 )
 
 #: Intent words that should not anchor a phrase on their own.
-_INTENT_STOP_TOKENS = {"my", "the", "a", "an", "this", "that", "my", "in", "on", "from"}
+#: Hinglish possessives/postpositions ("mera/meri/mere", "ka/ki/ke",
+#: "mein") behave like "my"/"the" (Phase 8): without them, "Meri
+#: railway ticket" anchors as "meri railway ticket" and never matches
+#: the actual document.
+_INTENT_STOP_TOKENS = {
+    "my", "the", "a", "an", "this", "that", "my", "in", "on", "from",
+    "mera", "meri", "mere", "ka", "ki", "ke", "mein", "me", "of",
+}
 
 #: Minimum Dice coefficient for a phrase to be considered a STRONG
 #: document-intent match (file-name stems are compared token-wise).
@@ -178,10 +187,19 @@ _SYNONYM_GROUPS: tuple[frozenset[str], ...] = (
 )
 
 #: Tokens ignored at the edges of an extracted field hint.
-_HINT_EDGE_FILLER = {"my", "the", "a", "an", "please", "thanks", "thank"}
+#: Hinglish edge fillers ("kya", "hai", "batao", ...) added in Phase 8
+#: so "roll number kya hai" cleans to the pure field hint "roll number".
+_HINT_EDGE_FILLER = {
+    "my", "the", "a", "an", "please", "thanks", "thank",
+    "kya", "hai", "hain", "h", "batao", "bata", "bataiye",
+    "thi", "tha", "me", "mein", "ka", "ki", "ke",
+}
 
 # Semantic-intent cues: open-ended, exploratory questions. These are
-# intent patterns, deliberately NOT field names.
+# intent patterns, deliberately NOT field names. Hinglish/Hindi word
+# forms are included so language-mixed queries classify correctly
+# (Phase 8): "batao"/"bataiye" = tell, "detail" = details, "likha" =
+# written, "baare" = about.
 _SEMANTIC_CUES: tuple[str, ...] = (
     r"\bsummar(y|ise|ize)\b",
     r"\bexplain\b",
@@ -196,9 +214,23 @@ _SEMANTIC_CUES: tuple[str, ...] = (
     r"\bmeaning\b",
     r"\bwhat.+(is|are).+(about|covered|included)\b",
     r"\b(show|give) me (the|an?) (summary|overview|details)\b",
+    # Hinglish exploratory cues (Roman script)
+    r"\bbata(o|iye|ayiye|ayye)\b",
+    r"\bbatao\b",
+    r"\b(bat\w*) detail\w*\b",
+    r"\bimportant detail\w*\b",
+    r"\bsab(\s+\w+)? (baare|bare)\b",
+    r"\bke baare\b",
+    r"\bme\w* kya likha\b",
+    r"\bme(in)? kya\b",
+    r"\bkya likha\b",
+    r"\bkya hai (is|is document)\b",
+    r"\bmujhe\b[^?]*\bbata\w*\b",
 )
 
 # Exact-intent cues: a specific attribute of a known document is asked for.
+# Hinglish "kya hai" ("what is") added in Phase 8 so mixed-language
+# field lookups stay on the deterministic SQLite path.
 _EXACT_CUES: tuple[str, ...] = (
     r"\bwhat('s| is| was| are| were)\b",
     r"\bwhich\b",
@@ -206,9 +238,24 @@ _EXACT_CUES: tuple[str, ...] = (
     r"\b(find|show|get|give)\b",
     r"\bhow much\b",
     r"\bmy\s+[a-z0-9]",
+    # Hinglish exact cues (Roman script)
+    r"\bkya hai\b",
+    r"\bkya h\b",
+    r"\bkya tha\b",
+    r"\bmer(a|i|e)\s+[a-z0-9]",
+    r"\bkonsa\b",
+    r"\bkitna\b",
 )
 
+# Exact-intent cues handled above (Phase 8 Hinglish included).
+
 _HINT_PATTERN_MY = re.compile(r"\bmy\s+([a-z0-9][a-z0-9 &'/\-\.]*)", re.IGNORECASE)
+
+# Hinglish possessive "mera/meri/mere" behaves like "my" (Phase 8):
+# "Mera roll number kya hai?" -> hint "roll number".
+_HINT_PATTERN_MERA = re.compile(
+    r"\bmer(a|i|e)\s+([a-z0-9][a-z0-9 &'/\-\.]*)", re.IGNORECASE
+)
 _HINT_PATTERN_THE = re.compile(
     r"\bthe\s+([a-z0-9][a-z0-9 &'/\-\.]*?)(?=\s+(?:in|of|from|on|for)\b|\s*$)",
     re.IGNORECASE,
@@ -607,10 +654,16 @@ def extract_field_hint(query: str) -> str | None:
     "What is the PNR in 4143027140.pdf?"   -> "pnr"
     """
 
-    for pattern in (_HINT_PATTERN_MY, _HINT_PATTERN_VERB, _HINT_PATTERN_THE):
+    # _HINT_PATTERN_MERA reports group(2) (group 1 is mera/meri/mere).
+    for pattern, group_index in (
+        (_HINT_PATTERN_MERA, 2),
+        (_HINT_PATTERN_MY, 1),
+        (_HINT_PATTERN_VERB, 1),
+        (_HINT_PATTERN_THE, 1),
+    ):
         match = pattern.search(query)
         if match:
-            hint = _clean_hint(match.group(1))
+            hint = _clean_hint(match.group(group_index))
             if hint:
                 return hint
     return None
@@ -1139,6 +1192,13 @@ def route_query(
     own_connection = connection is None
     started = time.perf_counter()
 
+    # Phase 8: Devanagari queries are transliterated to Latin BEFORE any
+    # deterministic classification/matching, so Hindi queries hit the
+    # same cues/synonym machinery as Hinglish ones. Detection of the
+    # user's language itself happens in answer_engine (on the ORIGINAL
+    # text); document values are never transliterated.
+    query_for_matching = transliterate_for_matching(query)
+
     try:
         if own_connection:
             connection = get_db_connection()
@@ -1151,18 +1211,18 @@ def route_query(
         ]
 
         t_after_known_fields = time.perf_counter()
-        signals = classify_query(query, known_fields)
+        signals = classify_query(query_for_matching, known_fields)
         t_after_classify = time.perf_counter()
 
         classification = signals["classification"]
-        document_filter = _extract_document_filter(query, connection)
+        document_filter = _extract_document_filter(query_for_matching, connection)
 
         # ---- Phase 6: document-intent detection ------------------------------
         # Restricts semantic retrieval to intent-matching documents BEFORE
         # the vector search (strong/weak policy below); pure-exact filename
         # filters still take precedence in exact lookups.
         if intent is None:
-            intent = detect_document_intent(query, connection)
+            intent = detect_document_intent(query_for_matching, connection)
         intent_restriction = (
             intent.get("restrict_to") if isinstance(intent, dict) else None
         )

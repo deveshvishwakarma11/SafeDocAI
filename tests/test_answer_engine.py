@@ -12,12 +12,7 @@ is required to run this suite.
 
 from __future__ import annotations
 
-import atexit
-import gc
-import hashlib
-import shutil
 import sys
-import tempfile
 from pathlib import Path
 
 _project_root = Path(__file__).resolve().parents[1]
@@ -26,6 +21,7 @@ for entry in (str(_project_root), str(_project_root / "src")):
         sys.path.insert(0, entry)
 
 import storage_engine  # the SAME module instance the router/engine bind to
+from _harness import redirect_storage_to_temp, seed_chroma_real_model
 
 import answer_engine
 from answer_engine import (
@@ -43,53 +39,7 @@ from storage_engine import ingest_into_sqlite
 # Isolation: redirect storage into a temp directory
 # ---------------------------------------------------------------------------
 
-_TEMP_DIR: Path | None = None
-_ORIGINALS: dict[str, Path] = {}
-
-
-def _redirect_storage_to_temp() -> Path:
-    global _TEMP_DIR
-    if _TEMP_DIR is not None:
-        return _TEMP_DIR
-
-    _TEMP_DIR = Path(tempfile.mkdtemp(prefix="safedocai-answer-tests-"))
-    _ORIGINALS.update(
-        DATA_DIR=storage_engine.DATA_DIR,
-        DB_PATH=storage_engine.DB_PATH,
-        CHROMA_PATH=storage_engine.CHROMA_PATH,
-    )
-    storage_engine.DATA_DIR = _TEMP_DIR
-    storage_engine.DB_PATH = _TEMP_DIR / "safedoc.db"
-    storage_engine.CHROMA_PATH = _TEMP_DIR / "chroma_db"
-    storage_engine._chroma_client = None
-    storage_engine._chroma_available = None
-    return _TEMP_DIR
-
-
-def _restore_storage() -> None:
-    global _TEMP_DIR
-    if _TEMP_DIR is None:
-        return
-    gc.collect()
-    shutil.rmtree(_TEMP_DIR, ignore_errors=True)
-    storage_engine.DATA_DIR = _ORIGINALS["DATA_DIR"]
-    storage_engine.DB_PATH = _ORIGINALS["DB_PATH"]
-    storage_engine.CHROMA_PATH = _ORIGINALS["CHROMA_PATH"]
-    storage_engine._chroma_client = None
-    storage_engine._chroma_available = None
-    _TEMP_DIR = None
-
-
-_redirect_storage_to_temp()
-atexit.register(_restore_storage)
-
-
-def _real_db_state() -> tuple[int, int, str] | None:
-    real_db = _ORIGINALS["DB_PATH"]
-    if not real_db.exists():
-        return None
-    data = real_db.read_bytes()
-    return (len(data), real_db.stat().st_mtime_ns, hashlib.sha256(data).hexdigest())
+_TEMP_DIR = redirect_storage_to_temp("safedocai-answer-tests-")
 
 
 # ---------------------------------------------------------------------------
@@ -139,33 +89,15 @@ def _seed_all() -> None:
 
     storage_engine.init_db()
 
+    doc_ids = []
     for record in _SEED_DOCS:
         parsed = dict(record)
         parsed["file_path"] = str((_TEMP_DIR / record["file_name"]).resolve())
-        record["doc_id"] = ingest_into_sqlite(parsed, Path("data/output/seed.json"))
+        doc_id = ingest_into_sqlite(parsed, Path("data/output/seed.json"))
+        record["doc_id"] = doc_id
+        doc_ids.append(doc_id)
 
-    collection = storage_engine.get_chroma_collection()
-    model = storage_engine.get_embedding_model()
-
-    for record in _SEED_DOCS:
-        chunks = storage_engine.chunk_text(record["raw_text"])
-        embeddings = model.encode(
-            chunks, batch_size=16, show_progress_bar=False,
-            normalize_embeddings=True,
-        )
-        ids = [f"doc_{record['doc_id']}_chunk_{i}" for i in range(len(chunks))]
-        metadatas = [
-            {
-                "document_id": str(record["doc_id"]),
-                "file_name": record["file_name"],
-                "chunk_id": i,
-            }
-            for i in range(len(chunks))
-        ]
-        collection.upsert(
-            ids=ids, documents=chunks,
-            embeddings=embeddings.tolist(), metadatas=metadatas,
-        )
+    seed_chroma_real_model(_SEED_DOCS, doc_ids)
 
     _DOCS_SEEDED = True
 
@@ -282,6 +214,7 @@ def test_exact_single_field_answer_deterministic() -> None:
     route_result = {
         "route": "exact",
         "fallback": {"occurred": False, "reason": None},
+        "field_hint": "roll number",
         "results": [
             {
                 "document_id": 2,
@@ -293,7 +226,9 @@ def test_exact_single_field_answer_deterministic() -> None:
         ],
     }
     payload = build_answer_from_exact(route_result)
-    assert payload["answer"] == "roll: 2407510100067"
+    # Phase 9: answer-focused phrasing; the VALUE stays verbatim.
+    assert payload["answer"] == "Your roll number is 2407510100067."
+    assert "2407510100067" in payload["answer"]
     assert payload["llm_called"] is False
     assert payload["grounded"] is True
     assert payload["sources"][0]["field_value"] == "2407510100067"
@@ -636,23 +571,35 @@ def run_all() -> None:
 
 
 def main() -> None:
-    real_db_before = _real_db_state()
-    try:
-        run_all()
-    finally:
-        real_db_after = _real_db_state()
-        _restore_storage()
+    tests = [(fn.__name__, fn) for fn in (
+        test_grounding_accepts_supported_values,
+        test_grounding_rejects_fabricated_numbers,
+        test_grounding_rejects_fabricated_identifiers,
+        test_grounding_comma_and_case_equivalence,
+        test_model_confidence_cannot_override_grounding,
+        test_exact_single_field_answer_deterministic,
+        test_exact_repeated_values_all_preserved,
+        test_exact_empty_results_insufficient_without_llm,
+        test_semantic_prompt_contains_context_and_rules,
+        test_semantic_valid_grounded_response_accepted,
+        test_semantic_unsupported_claim_rejected,
+        test_semantic_unknown_source_citation_dropped,
+        test_semantic_invalid_json_handled_safely,
+        test_semantic_truncated_response_rejected,
+        test_semantic_missing_sources_field_handled_safely,
+        test_answer_query_exact_no_llm_call,
+        test_answer_query_exact_repeated_values_distinct_sources,
+        test_answer_query_semantic_calls_mock_llm,
+        test_answer_query_semantic_grounded_without_citations_gets_chunk_sources,
+        test_answer_query_semantic_grounded_false_path,
+        test_answer_query_empty_retrieval_insufficient_no_llm,
+        test_answer_query_fallback_metadata_preserved,
+        test_answer_query_deterministic_for_repeated_exact_queries,
+        test_provenance_fields_in_every_payload,
+    )]
+    from _harness import run_tests
 
-    if real_db_before is None:
-        print("Isolation guard: real data/safedoc.db does not exist (nothing to protect).")
-    elif real_db_before != real_db_after:
-        print("Isolation guard FAILED: real data/safedoc.db was modified by the test run!")
-        raise SystemExit(1)
-    else:
-        print(
-            "Isolation guard OK: real data/safedoc.db untouched "
-            f"(size={real_db_after[0]} bytes, sha256={real_db_after[2][:12]}...)."
-        )
+    run_tests(tests, "Answer engine")
 
 
 if __name__ == "__main__":

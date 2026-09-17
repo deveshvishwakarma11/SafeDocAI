@@ -333,9 +333,8 @@ def should_skip_llm_for_type(
 # ============================================================================
 
 if __name__ == "__main__":
-    import json
     import sys
-    
+
     # Use utf-8 for stdout
     sys.stdout.reconfigure(encoding='utf-8')
     

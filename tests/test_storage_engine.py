@@ -18,18 +18,15 @@ and SHA-256 and fails the suite if either changed.
 
 from __future__ import annotations
 
-import atexit
-import gc
-import hashlib
 import json
-import shutil
 import sys
-import tempfile
 from pathlib import Path
 
 _project_root = Path(__file__).resolve().parents[1]
 if str(_project_root) not in sys.path:
     sys.path.insert(0, str(_project_root))
+
+from _harness import redirect_storage_to_temp, run_tests
 
 import src.storage_engine as storage_engine
 
@@ -48,71 +45,8 @@ from src.storage_engine import (
 # Test isolation: redirect storage into a temp directory
 # ---------------------------------------------------------------------------
 
-_TEMP_DIR: Path | None = None
-_ORIGINALS: dict[str, Path] = {}
-
-
-def _redirect_storage_to_temp() -> Path:
-    """Point storage_engine at a temp DATA_DIR/DB_PATH/CHROMA_PATH."""
-
-    global _TEMP_DIR
-
-    if _TEMP_DIR is not None:
-        return _TEMP_DIR
-
-    _TEMP_DIR = Path(tempfile.mkdtemp(prefix="safedocai-tests-"))
-
-    _ORIGINALS.update(
-        DATA_DIR=storage_engine.DATA_DIR,
-        DB_PATH=storage_engine.DB_PATH,
-        CHROMA_PATH=storage_engine.CHROMA_PATH,
-    )
-
-    storage_engine.DATA_DIR = _TEMP_DIR
-    storage_engine.DB_PATH = _TEMP_DIR / "safedoc.db"
-    storage_engine.CHROMA_PATH = _TEMP_DIR / "chroma_db"
-
-    return _TEMP_DIR
-
-
-def _restore_storage() -> None:
-    """Restore the original paths and remove the temp directory."""
-
-    global _TEMP_DIR
-
-    if _TEMP_DIR is None:
-        return
-
-    # storage_engine uses `with get_db_connection()` blocks that commit but
-    # never close the connection; collect garbage so Windows can delete the
-    # temp directory even if a connection object is still alive somewhere.
-    gc.collect()
-
-    shutil.rmtree(_TEMP_DIR, ignore_errors=True)
-
-    storage_engine.DATA_DIR = _ORIGINALS["DATA_DIR"]
-    storage_engine.DB_PATH = _ORIGINALS["DB_PATH"]
-    storage_engine.CHROMA_PATH = _ORIGINALS["CHROMA_PATH"]
-
-    _TEMP_DIR = None
-
-
 # Redirect immediately at import so no test can ever touch the real DB.
-_redirect_storage_to_temp()
-atexit.register(_restore_storage)
-
-
-def _real_db_state() -> tuple[int, int, str] | None:
-    """(size, mtime_ns, sha256) of the real production DB, or None."""
-
-    real_db = _ORIGINALS["DB_PATH"]
-
-    if not real_db.exists():
-        return None
-
-    data = real_db.read_bytes()
-
-    return (len(data), real_db.stat().st_mtime_ns, hashlib.sha256(data).hexdigest())
+_TEMP_DIR = redirect_storage_to_temp("safedocai-tests-")
 
 
 def _reset_db() -> None:
@@ -332,7 +266,7 @@ def test_load_parsed_json_rejects_missing_file() -> None:
 
 
 def run_all() -> None:
-    tests = [
+    tests = [(fn.__name__, fn) for fn in (
         test_decimal_values_stay_intact_in_chunks,
         test_large_paragraph_splits_without_losing_numbers,
         test_resolve_document_id_uses_exact_original_path,
@@ -342,46 +276,13 @@ def run_all() -> None:
         test_store_understanding_results_links_by_exact_path,
         test_store_understanding_results_fails_when_original_path_unknown,
         test_load_parsed_json_rejects_missing_file,
-    ]
+    )]
 
-    failed: list[str] = []
-
-    for test in tests:
-        try:
-            test()
-        except AssertionError as exc:
-            failed.append(f"{test.__name__}: {exc}")
-        except Exception as exc:  # noqa: BLE001
-            failed.append(f"{test.__name__}: RAISED {type(exc).__name__}: {exc}")
-
-    if failed:
-        print("Storage engine checks FAILED:")
-        for line in failed:
-            print(" -", line)
-        raise SystemExit(1)
-
-    print(f"Storage engine checks PASSED: {len(tests)}")
+    run_tests(tests, "Storage engine")
 
 
 def main() -> None:
-    real_db_before = _real_db_state()
-
-    try:
-        run_all()
-    finally:
-        real_db_after = _real_db_state()
-        _restore_storage()
-
-    if real_db_before is None:
-        print("Isolation guard: real data/safedoc.db does not exist (nothing to protect).")
-    elif real_db_before != real_db_after:
-        print("Isolation guard FAILED: real data/safedoc.db was modified by the test run!")
-        raise SystemExit(1)
-    else:
-        print(
-            "Isolation guard OK: real data/safedoc.db untouched "
-            f"(size={real_db_after[0]} bytes, sha256={real_db_after[2][:12]}...)."
-        )
+    run_all()
 
 
 if __name__ == "__main__":

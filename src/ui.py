@@ -25,7 +25,6 @@ Launch:
 from __future__ import annotations
 
 import logging
-import re
 import sys
 import time
 from pathlib import Path
@@ -67,11 +66,18 @@ APP_TITLE = "SafeDocAI"
 APP_TAGLINE = "Private. Local. Your Documents."
 
 #: Answer latency for the local model is high on CPU; make that
-#: explicit and honest in the loading state.
+#: explicit and honest in the loading state (Phase 9): a fast exact
+#: query gets a simple "checking" status; a semantic query gets the
+#: two-stage explanation (search = seconds, local generation = 1–2 min).
+EXACT_LOADING_TEXT = "Checking your documents…"
 SEMANTIC_LOADING_TEXT = (
-    "Local AI is thinking — this can take 1–2 minutes on CPU."
+    "Searching your documents… then generating the answer locally.  \n"
+    "Searching takes seconds — generating with the local model can take "
+    "1–2 minutes on CPU. Please keep this tab open."
 )
-EXACT_LOADING_TEXT = "Searching your documents…"
+
+#: Caption suffix appended to each answer with its measured total time.
+ELAPSED_CAPTION = "answered in {seconds:.1f} s"
 
 #: Lightweight deterministic retry limit for transient transport errors.
 MAX_TRANSIENT_RETRIES = 2
@@ -270,12 +276,27 @@ def _fallback_note(payload: dict[str, Any]) -> str | None:
     return "Fallback occurred during retrieval."
 
 
+def _source_files(payload: dict[str, Any]) -> list[str]:
+    """Unique source file names for the compact one-line Source view."""
+
+    names: list[str] = []
+    for source in payload.get("sources") or []:
+        if isinstance(source, dict):
+            name = source.get("file_name")
+            if name and name not in names:
+                names.append(str(name))
+    return names
+
+
 def render_result(payload: dict[str, Any]) -> None:
     """Render one normalized answer payload into the answer area.
 
-    This is the single rendering path for all result kinds: exact,
-    semantic, fallback, insufficient, and error states. It performs no
-    retrieval and no LLM work.
+    Phase 9: the main area shows ONLY the answer, a one-line Source,
+    a grounded/elapsed status line and (when applicable) the fallback
+    explainer. All technical provenance (document IDs, field names,
+    chunk IDs, distances, route metadata) lives inside a collapsed
+    "Details" expander. This is the single rendering path for all
+    result kinds; it performs no retrieval and no LLM work.
     """
 
     if not payload.get("ok", False):
@@ -293,31 +314,40 @@ def render_result(payload: dict[str, Any]) -> None:
             "to answer that."
         )
         if payload.get("insufficient_reason"):
-            st.caption(f"Reason: {payload['insufficient_reason']}")
-        _render_sources(payload, context="Available context")
+            with st.expander("Details"):
+                st.caption(f"Reason: {payload['insufficient_reason']}")
+                _render_sources(payload, context="Available context")
         return
 
     # -- Grounded answer ------------------------------------------------
-    grounded = bool(payload.get("grounded"))
     st.markdown("### Answer")
     st.markdown(f"> {answer}")
 
-    route_line = _route_label(payload)
-    grounded_line = "Yes ✅" if grounded else "No ⚠️"
-    st.caption(
-        f"Grounded: {grounded_line}   ·   Route: {route_line}"
-        f"   ·   Local AI used: {'Yes' if payload.get('llm_called') else 'No'}"
+    files = _source_files(payload)
+    if files:
+        st.markdown(f"**Source:** {', '.join(files)}")
+
+    grounded_line = "Yes ✅" if payload.get("grounded") else "No ⚠️"
+    total_ms = (payload.get("timings_ms") or {}).get("total")
+    elapsed_line = (
+        f"   ·   {ELAPSED_CAPTION.format(seconds=total_ms / 1000)}"
+        if isinstance(total_ms, (int, float)) and total_ms
+        else ""
     )
+    st.caption(f"Grounded: {grounded_line}{elapsed_line}")
 
     note = _fallback_note(payload)
     if note:
         st.info(note)
 
-    _render_sources(payload)
+    if files:
+        with st.expander("Details (sources & provenance)"):
+            st.caption(f"Route: {_route_label(payload)}")
+            _render_sources(payload)
 
 
 def _render_sources(payload: dict[str, Any], context: str = "Sources") -> None:
-    """Render source/provenance information for a payload."""
+    """Render DETAILED provenance (lives inside the collapsed expander)."""
 
     sources = payload.get("sources") or []
     if not sources:
@@ -353,14 +383,14 @@ def _render_sources(payload: dict[str, Any], context: str = "Sources") -> None:
 
     retrieved = payload.get("retrieved_chunks")
     if retrieved:
-        with st.expander("Retrieved chunks (provenance detail)"):
-            for chunk in retrieved:
-                if not isinstance(chunk, dict):
-                    continue
-                st.caption(
-                    f"{chunk.get('file_name', '?')} · chunk {chunk.get('chunk_id', '?')}"
-                    f" · distance {chunk.get('distance', '?')}"
-                )
+        st.caption("Retrieved chunks (provenance detail):")
+        for chunk in retrieved:
+            if not isinstance(chunk, dict):
+                continue
+            st.caption(
+                f"{chunk.get('file_name', '?')} · chunk {chunk.get('chunk_id', '?')}"
+                f" · distance {chunk.get('distance', '?')}"
+            )
 
 
 # ============================================================
@@ -491,12 +521,20 @@ def _render_history() -> None:
 
 
 def _looks_semantic(query: str) -> bool:
-    """Cheap heuristic purely for the loading message (not routing)."""
+    """Cheap heuristic purely for the loading message (not routing).
+
+    Phase 8: includes Hinglish exploratory cues ("batao", "ke baare",
+    "likha") so mixed-language queries get the honest long-run message.
+    """
 
     lowered = query.lower()
     return any(
         cue in lowered
-        for cue in ("what does", "tell me", "explain", "summarize", "about")
+        for cue in (
+            "what does", "tell me", "explain", "summarize", "about",
+            "batao", "bataiye", "bata ", "ke baare", "likha",
+            "important details", "kya likha", "mujhe",
+        )
     )
 
 

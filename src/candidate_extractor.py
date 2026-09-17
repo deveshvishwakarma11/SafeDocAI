@@ -8,8 +8,9 @@ This module is PURE and DETERMINISTIC:
 * no filesystem access, no randomness, no time dependence
 * same input text always yields the same candidates, ids, and spans
 
-It is NOT wired into the Phase 3 pipeline yet; document_understanding still
-runs the transcription flow until integration is approved.
+It is wired into the Phase 3 pipeline via selection_engine.py:
+document_understanding runs the selection flow, which calls the extractor
+here before planning each LLM selection call.
 
 Approved candidate schema (exactly what ``Candidate.to_dict`` returns)::
 

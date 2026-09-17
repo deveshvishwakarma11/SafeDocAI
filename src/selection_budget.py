@@ -1,8 +1,8 @@
 """
 Adaptive selection budget for the "selection instead of transcription" redesign.
 
-This module is pure logic with no pipeline wiring yet: document_understanding
-still runs the Phase 3 transcription flow until this is hooked in.
+This module is pure logic; it is wired into the pipeline via
+selection_engine.py, which plans every window's calls with these budgets.
 
 Approved budget logic (B=196/219)
 ---------------------------------

@@ -12,13 +12,8 @@ inside the isolated temp stores - it never enters production data.
 
 from __future__ import annotations
 
-import atexit
 import copy
-import gc
-import hashlib
-import shutil
 import sys
-import tempfile
 from pathlib import Path
 
 _project_root = Path(__file__).resolve().parents[1]
@@ -26,8 +21,9 @@ for entry in (str(_project_root), str(_project_root / "src")):
     if entry not in sys.path:
         sys.path.insert(0, entry)
 
-import storage_engine  # top-level: the SAME module instance query_router binds to
+from _harness import redirect_storage_to_temp, run_tests, seed_chroma_real_model
 
+import storage_engine  # the SAME module instance query_router binds to
 from storage_engine import ingest_into_sqlite
 from src.query_router import (
     CLASS_EXACT,
@@ -44,65 +40,7 @@ from src.query_router import (
 # Isolation: redirect storage into a temp directory
 # ---------------------------------------------------------------------------
 
-_TEMP_DIR: Path | None = None
-_ORIGINALS: dict[str, Path] = {}
-
-
-def _redirect_storage_to_temp() -> Path:
-    """Point storage_engine (and therefore the router) at temp paths."""
-
-    global _TEMP_DIR
-
-    if _TEMP_DIR is not None:
-        return _TEMP_DIR
-
-    _TEMP_DIR = Path(tempfile.mkdtemp(prefix="safedocai-router-tests-"))
-
-    _ORIGINALS.update(
-        DATA_DIR=storage_engine.DATA_DIR,
-        DB_PATH=storage_engine.DB_PATH,
-        CHROMA_PATH=storage_engine.CHROMA_PATH,
-    )
-
-    storage_engine.DATA_DIR = _TEMP_DIR
-    storage_engine.DB_PATH = _TEMP_DIR / "safedoc.db"
-    storage_engine.CHROMA_PATH = _TEMP_DIR / "chroma_db"
-
-    # Drop any cached Chroma client so it rebinds to the temp path.
-    storage_engine._chroma_client = None
-    storage_engine._chroma_available = None
-
-    return _TEMP_DIR
-
-
-def _restore_storage() -> None:
-    global _TEMP_DIR
-
-    if _TEMP_DIR is None:
-        return
-
-    gc.collect()
-    shutil.rmtree(_TEMP_DIR, ignore_errors=True)
-
-    storage_engine.DATA_DIR = _ORIGINALS["DATA_DIR"]
-    storage_engine.DB_PATH = _ORIGINALS["DB_PATH"]
-    storage_engine.CHROMA_PATH = _ORIGINALS["CHROMA_PATH"]
-    storage_engine._chroma_client = None
-    storage_engine._chroma_available = None
-
-    _TEMP_DIR = None
-
-
-_redirect_storage_to_temp()
-atexit.register(_restore_storage)
-
-
-def _real_db_state() -> tuple[int, int, str] | None:
-    real_db = _ORIGINALS["DB_PATH"]
-    if not real_db.exists():
-        return None
-    data = real_db.read_bytes()
-    return (len(data), real_db.stat().st_mtime_ns, hashlib.sha256(data).hexdigest())
+_TEMP_DIR = redirect_storage_to_temp("safedocai-router-tests-")
 
 
 # ---------------------------------------------------------------------------
@@ -173,37 +111,15 @@ def _seed_all() -> None:
 
     storage_engine.init_db()
 
+    doc_ids = []
     for record in _SEED_DOCS:
         parsed = dict(record)
         parsed["file_path"] = str((_TEMP_DIR / record["file_name"]).resolve())
-        record["doc_id"] = ingest_into_sqlite(parsed, Path("data/output/seed.json"))
+        doc_id = ingest_into_sqlite(parsed, Path("data/output/seed.json"))
+        record["doc_id"] = doc_id
+        doc_ids.append(doc_id)
 
-    collection = storage_engine.get_chroma_collection()
-    model = storage_engine.get_embedding_model()
-
-    for record in _SEED_DOCS:
-        chunks = storage_engine.chunk_text(record["raw_text"])
-        embeddings = model.encode(
-            chunks,
-            batch_size=16,
-            show_progress_bar=False,
-            normalize_embeddings=True,
-        )
-        ids = [f"doc_{record['doc_id']}_chunk_{i}" for i in range(len(chunks))]
-        metadatas = [
-            {
-                "document_id": str(record["doc_id"]),
-                "file_name": record["file_name"],
-                "chunk_id": i,
-            }
-            for i in range(len(chunks))
-        ]
-        collection.upsert(
-            ids=ids,
-            documents=chunks,
-            embeddings=embeddings.tolist(),
-            metadatas=metadatas,
-        )
+    seed_chroma_real_model(_SEED_DOCS, doc_ids)
 
     _DOCS_SEEDED = True
 
@@ -492,8 +408,8 @@ def test_deep_copy_results_not_shared_between_calls() -> None:
 # ---------------------------------------------------------------------------
 
 
-def run_all() -> None:
-    tests = [
+def main() -> None:
+    tests = [(fn.__name__, fn) for fn in (
         test_classification_exact_queries,
         test_classification_semantic_queries,
         test_classification_unknown_query,
@@ -517,46 +433,9 @@ def run_all() -> None:
         test_fallback_disabled_returns_explicit_insufficient,
         test_empty_and_invalid_inputs_rejected,
         test_deep_copy_results_not_shared_between_calls,
-    ]
+    )]
 
-    failed: list[str] = []
-
-    for test in tests:
-        try:
-            test()
-        except AssertionError as exc:
-            failed.append(f"{test.__name__}: {exc}")
-        except Exception as exc:  # noqa: BLE001
-            failed.append(f"{test.__name__}: RAISED {type(exc).__name__}: {exc}")
-
-    if failed:
-        print("Query router tests FAILED:")
-        for line in failed:
-            print(" -", line)
-        raise SystemExit(1)
-
-    print(f"Query router tests PASSED: {len(tests)}")
-
-
-def main() -> None:
-    real_db_before = _real_db_state()
-
-    try:
-        run_all()
-    finally:
-        real_db_after = _real_db_state()
-        _restore_storage()
-
-    if real_db_before is None:
-        print("Isolation guard: real data/safedoc.db does not exist (nothing to protect).")
-    elif real_db_before != real_db_after:
-        print("Isolation guard FAILED: real data/safedoc.db was modified by the test run!")
-        raise SystemExit(1)
-    else:
-        print(
-            "Isolation guard OK: real data/safedoc.db untouched "
-            f"(size={real_db_after[0]} bytes, sha256={real_db_after[2][:12]}...)."
-        )
+    run_tests(tests, "Query router")
 
 
 if __name__ == "__main__":
