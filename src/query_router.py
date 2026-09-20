@@ -753,6 +753,11 @@ def classify_query(
     2. A semantic-intent cue (summarize / explain / what does it say ...) -> SEMANTIC.
     3. An exact-intent cue (what is / which / find my ...) -> EXACT.
     4. A field hint that resolves against known/dynamic field names -> EXACT.
+    4b. A BARE field query ("roll number", "date of birth", "roll number
+        kya hai") whose filler-stripped text resolves against the dynamic
+        stored field names -> EXACT (same lookup path as case 4). Semantic
+        cues keep absolute precedence, and queries naming no stored field
+        ("PAN", "IFSC", "weather") keep their current route.
     5. Otherwise UNKNOWN (the router still attempts retrieval, recorded as such).
     """
 
@@ -788,6 +793,26 @@ def classify_query(
                 else:
                     classification = CLASS_UNKNOWN
                     matched_cue = None
+
+    # Phase 10.1: bare field queries -------------------------------------
+    # A short query like "roll number", "date of birth" or "roll number
+    # kya hai" carries no personal/verb anchor ("my", "mera", "find",
+    # "the"), so extract_field_hint() returns None for it even though
+    # the WHOLE filler-stripped query names a stored metadata field.
+    # When the dynamic resolver (live extracted_metadata fields + the
+    # generic synonym groups) recognizes the cleaned query, the query
+    # goes through the SAME deterministic exact path as the anchored
+    # forms. Semantic-intent cues keep absolute precedence: an
+    # open-ended query ("summarize my document") is never upgraded, and
+    # queries naming no stored field ("PAN", "IFSC", "weather") keep
+    # their current route.
+    if classification in (CLASS_EXACT, CLASS_UNKNOWN) and field_hint is None:
+        bare_hint = _clean_hint(query)
+        if bare_hint and _resolve_field_variants(bare_hint, known_fields):
+            field_hint = bare_hint
+            if classification == CLASS_UNKNOWN:
+                classification = CLASS_EXACT
+                matched_cue = "bare field query matches stored metadata"
 
     return {
         "classification": classification,

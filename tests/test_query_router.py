@@ -327,6 +327,70 @@ def test_unknown_query_routes_to_semantic_without_fabrication() -> None:
 
 
 # ---------------------------------------------------------------------------
+# Phase 10.1: bare field queries (no personal/verb anchor)
+# ---------------------------------------------------------------------------
+
+
+def test_bare_field_query_routes_exact() -> None:
+    """"roll number" (bare, no "my"/question anchor) must hit the exact
+    SQLite path instead of the slow semantic LLM path."""
+    _seed_all()
+    result = route_query("roll number")
+    assert result["classification"] == CLASS_EXACT, result["classification"]
+    assert result["route"] == ROUTE_EXACT
+    assert result["fallback"]["occurred"] is False
+    matches = [row for row in result["results"] if row["field_name"] == "roll"]
+    assert len(matches) == 1
+    assert matches[0]["field_value"] == "12345678"
+    assert matches[0]["file_name"] == "marksheet.pdf"
+
+
+def test_bare_field_query_variants_routes_exact() -> None:
+    _seed_all()
+    for query in ("Roll No", "roll number kya hai?", "my roll number",
+                  "Mera roll number kya hai?"):
+        result = route_query(query)
+        assert result["route"] == ROUTE_EXACT, (query, result["route"])
+        assert any(
+            row["field_value"] == "12345678" for row in result["results"]
+        ), query
+
+
+def test_bare_multi_document_field_lists_all_values() -> None:
+    """Ambiguity rule: "dob" exists in two documents with different values.
+    The bare query must list ALL values with provenance — never silently
+    pick one."""
+    _seed_all()
+    result = route_query("date of birth")
+    assert result["route"] == ROUTE_EXACT
+    matches = [row for row in result["results"] if row["field_name"] == "dob"]
+    assert {row["field_value"] for row in matches} == {
+        "06-06-2006", "01-01-1980",
+    }
+    assert {row["file_name"] for row in matches} == {
+        "marksheet.pdf", "electricity_bill.pdf",
+    }
+
+
+def test_unmapped_short_queries_stay_semantic() -> None:
+    """Short queries naming NO stored field keep the current route."""
+    _seed_all()
+    for query in ("PAN", "IFSC", "enrollment ID"):
+        result = route_query(query)
+        assert result["route"] == ROUTE_SEMANTIC, (query, result["route"])
+        assert result["fallback"]["occurred"] is False, query
+
+
+def test_unrelated_short_queries_never_exact() -> None:
+    """"weather" / "hello" / "2 + 2" must not become document lookups."""
+    _seed_all()
+    for query in ("weather", "hello", "2 + 2"):
+        result = route_query(query)
+        assert result["classification"] != CLASS_EXACT, (query, result)
+        assert result["route"] == ROUTE_SEMANTIC, (query, result["route"])
+
+
+# ---------------------------------------------------------------------------
 # Provenance + determinism tests
 # ---------------------------------------------------------------------------
 
@@ -428,6 +492,11 @@ def main() -> None:
         test_open_ended_semantic_query,
         test_semantic_query_no_useful_result,
         test_unknown_query_routes_to_semantic_without_fabrication,
+        test_bare_field_query_routes_exact,
+        test_bare_field_query_variants_routes_exact,
+        test_bare_multi_document_field_lists_all_values,
+        test_unmapped_short_queries_stay_semantic,
+        test_unrelated_short_queries_never_exact,
         test_provenance_fields_present,
         test_deterministic_for_repeated_identical_queries,
         test_fallback_disabled_returns_explicit_insufficient,

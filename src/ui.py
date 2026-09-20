@@ -8,6 +8,13 @@ retrieval/LLM-related to :func:`answer_engine.answer_query` — the UI
 implements no SQL, no Chroma search, no LLM prompting, no grounding
 validation of its own.
 
+Phase 10: the ask area is a real chat conversation. Every submission
+(Enter key or the composer's send arrow — one shared code path) becomes
+a visible USER message immediately and clears the composer; the answer
+is appended below it as an assistant bubble. Previous turns stay
+visible for the whole UI session and new queries append instead of
+replacing anything.
+
 Privacy:
 * Local filesystem paths only; Ollama on localhost only.
 * No external frontend assets, analytics, or remote APIs.
@@ -37,9 +44,17 @@ if str(_HERE) not in sys.path:
 
 try:  # src/ on sys.path (pipeline style)
     import storage_engine
-    from answer_engine import INSUFFICIENT_CONTEXT_MESSAGE, answer_query
+    from answer_engine import (
+        INSUFFICIENT_CONTEXT_MESSAGE,
+        LLMUnavailableError,
+        answer_query,
+    )
 except ImportError:  # project root on sys.path
-    from src.answer_engine import INSUFFICIENT_CONTEXT_MESSAGE, answer_query
+    from src.answer_engine import (
+        INSUFFICIENT_CONTEXT_MESSAGE,
+        LLMUnavailableError,
+        answer_query,
+    )
     from src import storage_engine
 
 import streamlit as st
@@ -151,8 +166,11 @@ def build_payload(query: str) -> dict[str, Any]:
 
     try:
         result = answer_query(query)
-    except ConnectionError:
-        # llm_engine raises ConnectionError when Ollama is unreachable.
+    except (ConnectionError, LLMUnavailableError):
+        # The local model transport is unreachable (llm_engine raises
+        # ConnectionError via health paths; the semantic generation path
+        # raises LLMUnavailableError after exhausting transport retries).
+        # A service-down query must NOT read as "not found in documents".
         logger.error("Ollama unreachable for query: %r", query)
         return _failure_payload(
             "The local AI service (Ollama) is not reachable. "
@@ -263,11 +281,6 @@ def _fallback_note(payload: dict[str, Any]) -> str | None:
         return None
 
     route = str(payload.get("retrieval_route") or "")
-    if route == "semantic" and payload.get("llm_called"):
-        return (
-            "Exact field match was not found, so SafeDocAI searched the "
-            "relevant document content."
-        )
     if route == "semantic":
         return (
             "Exact field match was not found, so SafeDocAI searched the "
@@ -433,91 +446,202 @@ def run_app() -> None:
             "🔒 **Private & local.** All processing happens on this machine. "
             "No document content leaves your computer."
         )
+        if st.button("🗑️ Clear conversation", use_container_width=True):
+            for key in (
+                "chat_history", "history",  # current + legacy history keys
+                "pending_query", "query_input", "_scroll_pending",
+            ):
+                st.session_state.pop(key, None)
+            st.rerun()
 
     # ---------------- Header ----------------
     st.title(APP_TITLE)
     st.caption(f"**{APP_TAGLINE}**  ·  offline · evidence-grounded answers")
 
-    # ---------------- Ask area ----------------
+    # ---------------- Ask area (chat) ----------------
     st.markdown("#### Ask SafeDocAI")
 
-    default_query = st.session_state.get("pending_query", "")
-    query = st.text_area(
-        "Your question",
-        value=default_query,
-        height=90,
-        placeholder="e.g. What is my roll number?",
-        label_visibility="collapsed",
-        key="query_input",
-    )
-
-    col1, col2, _ = st.columns([1, 1, 4])
-    ask_clicked = col1.button("Ask", type="primary", use_container_width=True)
-    clear_clicked = col2.button("Clear", use_container_width=True)
-
-    if clear_clicked:
-        for key in ("query_input", "pending_query", "history"):
-            st.session_state.pop(key, None)
-        st.rerun()
+    history: list[dict[str, Any]] = st.session_state.get("chat_history")
+    if not isinstance(history, list):
+        history = []
+        st.session_state["chat_history"] = history
 
     if not documents:
         st.warning("No documents are stored yet. Run the pipeline first.")
+
+    # -- 1) Conversation (oldest → newest), then examples when empty ----
+    # A just-submitted query is already in the history with payload=None,
+    # so its user bubble (with a searching placeholder) is visible for
+    # the whole processing run — the chat never loses the question.
+    _render_conversation(history)
+    if not history and documents:
+        _render_examples()
+
+    # -- 2) Scroll toward the newest message when one was just added ----
+    if st.session_state.pop("_scroll_pending", False):
+        _scroll_to_bottom()
+
+    # -- 3) Answer a query submitted on the previous run ----------------
+    # Processed exactly once, below the conversation so the spinner and
+    # the pending user bubble are both visible; then rerun so the
+    # finished answer renders inside the conversation above the composer
+    # (which stays hidden while busy — a natural duplicate-submit guard).
+    pending = str(st.session_state.pop("pending_query", "") or "").strip()
+    if pending and documents:
+        _answer_pending(history, pending)
+        st.session_state["_scroll_pending"] = True
+        st.rerun()
+    elif pending:
+        # Composer is disabled without documents; drop any orphaned
+        # request and repaint the cleaned conversation.
+        while history and history[-1].get("payload") is None:
+            history.pop()
+        st.rerun()
+
+    # -- 4) Composer -----------------------------------------------------
+    # st.chat_input auto-clears after submission; Enter and the send
+    # arrow both land here, so there is exactly ONE submission path.
+    prompt = st.chat_input("e.g. What is my roll number?", disabled=not documents)
+    if prompt is None:
         return
 
-    if not ask_clicked:
-        if not query and not default_query:
-            _render_examples()
-        _render_history()
-        return
-
-    # ---------------- Query handling ----------------
-    if not query.strip():
+    action, entry = _prepare_submission(history, prompt)
+    if action == "empty":
         st.warning("Please enter a question before asking.")
         return
-
-    # Deterministic transient retry for transport hiccups.
-    payload: dict[str, Any] | None = None
-    for attempt in range(1, MAX_TRANSIENT_RETRIES + 1):
-        loading = SEMANTIC_LOADING_TEXT if _looks_semantic(query) else EXACT_LOADING_TEXT
-        with st.spinner(loading):
-            payload = build_payload(query)
-        if payload.get("ok") or attempt == MAX_TRANSIENT_RETRIES:
-            break
-
-    # Chat-style history (most recent first); rendered on every run.
-    history: list[dict[str, Any]] = st.session_state.setdefault("history", [])
-    if _should_record_query(history, query):
-        history.insert(0, {"query": query, "payload": payload})
-        history[:] = history[:MAX_HISTORY_ENTRIES]
-
-    st.session_state["pending_query"] = query
+    if action == "duplicate":
+        st.info("You just asked that — the answer is above.")
+        return
+    st.session_state["pending_query"] = (entry or {}).get("query", "")
+    st.session_state["_scroll_pending"] = True
     st.rerun()
 
 
 def _should_record_query(history: list[dict[str, Any]] | None, query: str) -> bool:
-    """True when this query is new and belongs in the visible history.
+    """True when this query is new and belongs at the end of the history.
 
-    The identical query asked again in a row is NOT re-recorded: with a
-    slow local model this prevents accidental duplicate LLM runs from
-    spamming the history with identical entries.
+    History is oldest-first, so only the LAST entry matters: re-asking
+    the identical query immediately after it was answered is treated as
+    an accidental duplicate (with a slow local model, a double-Enter
+    would otherwise spam identical LLM runs) and is NOT recorded.
     """
 
     if not history:
         return True
-    return history[0].get("query") != query
+    last = history[-1]
+    if not isinstance(last, dict):
+        return True
+    return last.get("query") != query
 
 
-def _render_history() -> None:
-    """Render the stored Q/A history (chat-style, newest first)."""
+def _prepare_submission(
+    history: list[dict[str, Any]], raw_query: str
+) -> tuple[str, dict[str, Any] | None]:
+    """Validate + record a submitted query as a pending USER message.
 
-    history: list[dict[str, Any]] = st.session_state.get("history") or []
-    for index, entry in enumerate(history):
-        if not isinstance(entry, dict) or "payload" not in entry:
+    Pure state-transition helper for the chat composer (no Streamlit
+    rendering, no engine calls). Returns one of:
+
+    * ``("empty", None)``     — blank/whitespace query; nothing recorded
+    * ``("duplicate", None)`` — identical to the just-answered query
+    * ``("accepted", entry)`` — ``entry`` appended to ``history`` with
+      ``payload=None`` (assistant answer still pending)
+
+    The oldest-first history stays bounded by MAX_HISTORY_ENTRIES.
+    """
+
+    query = (raw_query or "").strip()
+    if not query:
+        return "empty", None
+    if not _should_record_query(history, query):
+        return "duplicate", None
+    entry: dict[str, Any] = {"query": query, "payload": None}
+    history.append(entry)
+    del history[:-MAX_HISTORY_ENTRIES]
+    return "accepted", entry
+
+
+def _answer_pending(history: list[dict[str, Any]], pending: str) -> None:
+    """Process ``pending`` and attach the assistant payload to its entry.
+
+    Delegates to :func:`build_payload` (and therefore answer_query)
+    unchanged, with the same spinner and transient-retry behavior as
+    before. Never raises: every failure mode (including Ollama being
+    unreachable) degrades to a friendly payload that renders as the
+    assistant bubble below the user's question.
+    """
+
+    entry: dict[str, Any] | None = None
+    for candidate in reversed(history):
+        if (
+            isinstance(candidate, dict)
+            and candidate.get("query") == pending
+            and candidate.get("payload") is None
+        ):
+            entry = candidate
+            break
+    if entry is None:
+        entry = {"query": pending, "payload": None}
+        history.append(entry)
+        del history[:-MAX_HISTORY_ENTRIES]
+
+    # Deterministic transient retry for transport hiccups (unchanged).
+    loading = SEMANTIC_LOADING_TEXT if _looks_semantic(pending) else EXACT_LOADING_TEXT
+    payload: dict[str, Any] | None = None
+    for attempt in range(1, MAX_TRANSIENT_RETRIES + 1):
+        with st.spinner(loading):
+            payload = build_payload(pending)
+        if payload.get("ok") or attempt == MAX_TRANSIENT_RETRIES:
+            break
+    entry["payload"] = payload
+
+
+def _render_conversation(history: list[dict[str, Any]]) -> None:
+    """Render the whole conversation, oldest → newest, as chat bubbles.
+
+    Each recorded turn shows the user's question and, once available,
+    the assistant answer via :func:`render_result` — the single
+    rendering path that keeps the grounded-answer view and the Details
+    (sources & provenance) expander identical to previous phases.
+    """
+
+    for entry in history:
+        if not isinstance(entry, dict) or "query" not in entry:
             continue
-        st.markdown(f"**Q: {entry.get('query', '')}**")
-        render_result(entry["payload"])
-        if index < len(history) - 1:
-            st.divider()
+        with st.chat_message("user", avatar="🧑"):
+            st.markdown(str(entry.get("query", "")))
+        with st.chat_message("assistant", avatar="📄"):
+            payload = entry.get("payload")
+            if payload is None:
+                st.caption("Searching your documents…")
+            else:
+                render_result(payload)
+
+
+def _scroll_to_bottom() -> None:
+    """Best-effort scroll toward the newest message (inline JS only).
+
+    Implemented as a zero-height inline component so the app stays
+    100% local — no external assets are loaded. Every failure mode is
+    silently ignored: this is cosmetic, never load-bearing.
+    """
+
+    try:
+        from streamlit.components.v1 import html as _components_html
+
+        _components_html(
+            "<script>(()=>{try{"
+            "const d=window.parent.document;"
+            "const main=d.querySelector('section.main')"
+            "||d.querySelector('[data-testid=\"stMain\"]')"
+            "||d.querySelector('[data-testid=\"stAppViewContainer\"]');"
+            "if(main){main.scrollTop=main.scrollHeight;}"
+            "window.parent.scrollTo(0,window.parent.document.body.scrollHeight);"
+            "}catch(e){}})();</script>",
+            height=0,
+        )
+    except Exception:  # noqa: BLE001 — cosmetic only, never break the app
+        logger.debug("Auto-scroll skipped", exc_info=True)
 
 
 def _looks_semantic(query: str) -> bool:
@@ -533,7 +657,7 @@ def _looks_semantic(query: str) -> bool:
         for cue in (
             "what does", "tell me", "explain", "summarize", "about",
             "batao", "bataiye", "bata ", "ke baare", "likha",
-            "important details", "kya likha", "mujhe",
+            "important details", "kya likha", "kya details", "mujhe",
         )
     )
 
@@ -544,8 +668,14 @@ def _render_examples() -> None:
     for index, example in enumerate(_EXAMPLE_QUERIES):
         with columns[index % len(columns)]:
             if st.button(example, key=f"example_{index}"):
-                st.session_state["pending_query"] = example
-                st.rerun()
+                # Examples go through the SAME submission path as the
+                # composer (record user message → pending → process).
+                history = st.session_state.setdefault("chat_history", [])
+                action, entry = _prepare_submission(history, example)
+                if action == "accepted" and entry is not None:
+                    st.session_state["pending_query"] = entry["query"]
+                    st.session_state["_scroll_pending"] = True
+                    st.rerun()
 
 
 def _inject_css() -> None:
@@ -569,6 +699,15 @@ def _inject_css() -> None:
             }
             div[data-testid="stButton"] > button {
                 border-radius: 8px;
+            }
+            [data-testid="stChatMessage"] {
+                background: rgba(23, 27, 35, 0.75);
+                border: 1px solid #2a2f3a;
+                border-radius: 10px;
+            }
+            [data-testid="stChatInput"] textarea {
+                background: #171b23;
+                color: #e8eaed;
             }
         </style>
         """,

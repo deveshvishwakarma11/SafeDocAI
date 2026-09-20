@@ -58,8 +58,20 @@ except ImportError:  # project root on sys.path (test/tooling style)
     from src.query_router import route_query
 
 
+class LLMUnavailableError(RuntimeError):
+    """The local model transport is unreachable/timed out.
+
+    Raised by the semantic path (never the exact path) so callers can
+    distinguish "Ollama is down" from a legitimate insufficient-context
+    answer, which must never be reported when the model was never
+    reachable. Transport *retries* inside llm_engine are still exhausted
+    before this surfaces.
+    """
+
+
 __all__ = [
     "INSUFFICIENT_CONTEXT_MESSAGE",
+    "LLMUnavailableError",
     "ANSWER_NUM_PREDICT",
     "answer_query",
     "build_answer_from_exact",
@@ -79,9 +91,33 @@ INSUFFICIENT_CONTEXT_MESSAGE = (
     "to answer this."
 )
 
-#: Output cap for the local model. The schema is one short prose answer
-#: plus a tiny sources array; 256 tokens is ample headroom on CPU.
+#: Output cap for the local model (fact answers). The schema is one short
+#: prose answer plus a tiny sources array; 256 tokens is ample headroom.
 ANSWER_NUM_PREDICT = 256
+
+# ------------------------------------------------------------
+# Phase 9.1: summary-query retrieval policy. Summary questions
+# ("What does my railway ticket contain?") need broader coverage
+# than single-fact lookups, so they get their OWN bounded budget —
+# fact queries keep the default top_k/context unchanged.
+# ------------------------------------------------------------
+
+#: Candidate chunks fetched for summary requests (default fact path uses 3).
+SUMMARY_TOP_K = 6
+
+#: Context character budget for summary prompts (fact path: MAX_CONTEXT_CHARS).
+#: Bounded so prompt + context + ANSWER_NUM_PREDICT stay inside the local
+#: model's DEFAULT_NUM_CTX window.
+SUMMARY_MAX_CONTEXT_CHARS = 4000
+
+#: Chunks whose normalized token overlap with an already-kept chunk exceeds
+#: this are treated as near-duplicates and dropped from summary context.
+SUMMARY_DEDUPE_JACCARD = 0.8
+
+#: Output cap for summary generations. The summary prompt allows at most
+#: 5 bullets plus a sources array; 384 tokens keeps a compliant response
+#: safely untruncated (done_reason == "length" triggers a bounded retry).
+SUMMARY_NUM_PREDICT = 384
 
 # ------------------------------------------------------------
 # Phase 8: language-aware fixed strings (deterministic, no LLM).
@@ -425,8 +461,21 @@ _LENGTH_RULE_FACT = (
     "do not add background, and do not list unrelated details."
 )
 _LENGTH_RULE_SUMMARY = (
-    "- The user asked for an overview/summary. Give a concise paragraph "
-    "(max 4 sentences)."
+    "- The user asked for an overview/summary of what the document(s) "
+    "actually contain. Use ONLY information present in the supplied "
+    "context; do NOT use outside knowledge of what such documents usually "
+    "contain; do NOT guess or infer values that are not written in the "
+    "context. Write AT MOST 5 short bullet points (or one short paragraph "
+    "of 3 sentences). Pick the MOST important facts and stop — do NOT try "
+    "to list everything, do not pad, do not dump the document. Each bullet "
+    "is one concrete fact copied EXACTLY from the context (names, dates, "
+    "IDs, amounts, options, rules). Every number, date and identifier you "
+    "write MUST appear character-for-character in the context: NEVER split, "
+    "reformat or abbreviate a value (write the ID exactly as shown, e.g. "
+    "\"M103B71\", never a fragment of it). Do not describe the document "
+    "generically. If the context is too thin to summarize, say so "
+    "explicitly. Keep the whole JSON response short and complete — it must "
+    "END with the closing brace."
 )
 
 
@@ -480,8 +529,10 @@ def build_semantic_prompt(
     if language == LANG_HINGLISH:
         language_rule = (
             "- The user asked in Hinglish (Roman Hindi mixed with English). "
-            "Write the answer in natural conversational Hinglish (e.g. "
-            "'Aapka roll number 12345 hai.'), not in formal English.\n"
+            "Write the answer in natural conversational Hinglish written in "
+            "ROMAN script (e.g. "
+            "'Aapka roll number 12345 hai.'), not in formal English and not "
+            "in Devanagari script.\n"
         )
     elif language == LANG_HINDI:
         language_rule = (
@@ -584,6 +635,73 @@ def _build_context_text(chunks: list[dict[str, Any]]) -> str:
     return "\n\n".join(str(chunk.get("text", "")) for chunk in chunks)
 
 
+# ------------------------------------------------------------
+# Phase 9.1: summary context assembly. Retrieval hands back the
+# top-N reranked chunks; for summaries we (a) drop near-duplicate
+# chunks so the bounded window is spent on DISTINCT content and
+# (b) round-robin across documents so multi-document coverage beats
+# one document's tail. Pure reordering/removal: no chunk is ever
+# ADDED that retrieval did not return, and every chunk keeps its
+# provenance.
+# ------------------------------------------------------------
+
+
+_TOKEN_RE = re.compile(r"[a-z0-9]+")
+
+
+def _normalized_tokens(text: str) -> frozenset[str]:
+    return frozenset(_TOKEN_RE.findall(str(text or "").lower()))
+
+
+def _is_near_duplicate(candidate: frozenset[str], kept: frozenset[str]) -> bool:
+    if not candidate or not kept:
+        return False
+    union = candidate | kept
+    if not union:
+        return False
+    return len(candidate & kept) / len(union) > SUMMARY_DEDUPE_JACCARD
+
+
+def _diverse_chunks(chunks: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Drop near-duplicates, then round-robin across documents.
+
+    Input order (retrieval/rerank relevance) is preserved within each
+    document; the output preserves relative relevance globally.
+    """
+
+    kept: list[dict[str, Any]] = []
+    kept_tokens: list[frozenset[str]] = []
+    for chunk in chunks:
+        tokens = _normalized_tokens(chunk.get("text", ""))
+        if any(_is_near_duplicate(tokens, seen) for seen in kept_tokens):
+            continue
+        kept.append(chunk)
+        kept_tokens.append(tokens)
+
+    by_doc: dict[Any, list[dict[str, Any]]] = {}
+    for chunk in kept:
+        by_doc.setdefault(chunk.get("document_id"), []).append(chunk)
+
+    if len(by_doc) <= 1:
+        return kept
+
+    queues = list(by_doc.values())
+    diverse: list[dict[str, Any]] = []
+    while any(queues):
+        for queue in queues:
+            if queue:
+                diverse.append(queue.pop(0))
+    return diverse
+
+
+#: One strict retry for summary answers: bounded (single attempt, same
+#: prompt, no parameter changes) recovery when the first generation was
+#: truncated mid-JSON or came back empty/unparseable. Un-GROUNDED content
+#: is NEVER retried — that would be asking the model to try harder to
+#: slip past validate_grounding.
+SUMMARY_MAX_RETRIES = 1
+
+
 def _generate_semantic_answer(
     question: str,
     chunks: list[dict[str, Any]],
@@ -597,30 +715,65 @@ def _generate_semantic_answer(
     Phase 8: the user's language is detected deterministically (never by
     the LLM) and pinned in the prompt so the answer arrives in the
     language the question was asked in.
+
+    Phase 9.1: summary requests additionally get ONE bounded retry when
+    the generation is truncated or unparseable (same strict prompt, no
+    parameter changes). Grounding rejections are final and never retried.
     """
 
-    context_text = _build_context_text(chunks)[:MAX_CONTEXT_CHARS]
+    summary = is_summary_request(question)
+    if summary:
+        chunks = _diverse_chunks(chunks)
+        max_chars = SUMMARY_MAX_CONTEXT_CHARS
+    else:
+        max_chars = MAX_CONTEXT_CHARS
+
+    context_text = _build_context_text(chunks)[:max_chars]
 
     prompt = build_semantic_prompt(
         question,
         chunks,
         language=detect_language(question),
-        style="summary" if is_summary_request(question) else "fact",
+        style="summary" if summary else "fact",
     )
 
-    meta = generate_with_meta(
-        prompt,
-        num_predict=ANSWER_NUM_PREDICT,
-    )
+    attempts = SUMMARY_MAX_RETRIES + 1 if summary else 1
+    num_predict = SUMMARY_NUM_PREDICT if summary else ANSWER_NUM_PREDICT
+    for attempt in range(attempts):
+        meta = generate_with_meta(
+            prompt,
+            num_predict=num_predict,
+        )
 
-    if meta is None:
-        return None
+        if meta is None:
+            # Transport-level failure (Ollama unreachable / timed out):
+            # surfaced so callers report "AI service down" instead of a
+            # misleading "not found in your documents".
+            raise LLMUnavailableError(
+                "local model transport returned no response"
+            )
 
-    if meta.get("done_reason") == "length":
-        # Truncated mid-object: the JSON contract cannot be trusted.
-        return None
+        text = meta.get("text")
+        unrecoverable = (
+            meta.get("done_reason") == "length"
+            or not isinstance(text, str)
+            or not text.strip()
+            or extract_json(text) is None
+        )
+        if unrecoverable:
+            # Truncated mid-object or unparseable: the JSON contract cannot
+            # be trusted. A summary retry may still succeed within budget;
+            # a fact query has no retry (attempts == 1).
+            if attempt + 1 < attempts:
+                continue
+            return None
 
-    return parse_semantic_response(meta.get("text"), chunks, context_text)
+        # Valid JSON: parse + ground-validate. A grounding REJECTION here
+        # is FINAL — the same strict prompt is never re-rolled hoping the
+        # model slips past validate_grounding.
+        return parse_semantic_response(text, chunks, context_text)
+
+    return None
 
 
 # ============================================================
@@ -652,6 +805,14 @@ def _public_payload(
         "grounded": grounded,
         "llm_called": llm_called,
         "insufficient": not grounded and not sources,
+        "retrieved_chunks": [
+            {
+                "document_id": c.get("document_id"),
+                "file_name": c.get("file_name"),
+                "chunk_id": c.get("chunk_id"),
+            }
+            for c in route_result.get("results", [])
+        ],
     }
     if extra:
         payload.update(extra)
@@ -721,7 +882,14 @@ def answer_query(
             },
         }
 
-    route_result = route_query(query, top_k=top_k, max_distance=max_distance)
+    # Phase 9.1: summary requests fetch a wider (still bounded) candidate
+    # set so the summary covers distinct sections; explicit caller top_k
+    # always wins. Fact queries are unaffected.
+    effective_top_k = top_k
+    if top_k == 3 and is_summary_request(query):
+        effective_top_k = SUMMARY_TOP_K
+
+    route_result = route_query(query, top_k=effective_top_k, max_distance=max_distance)
 
     router_ms = round((time.perf_counter() - started) * 1000, 3)
 

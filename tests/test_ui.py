@@ -360,10 +360,233 @@ class TestAskFlow(unittest.TestCase):
         self.assertTrue(ui._should_record_query(None, "What is my roll number?"))
 
 
+class TestOllamaUnavailableHandling(unittest.TestCase):
+    """Ollama-down must read as 'service not reachable', never as 'not found'."""
+
+    def test_24_llm_unavailable_error_shows_ollama_message(self):
+        """The semantic path raises LLMUnavailableError when transport is down."""
+        import answer_engine as ae
+
+        harness = _StreamlitHarness()
+        with harness, mock.patch.object(
+            ui, "answer_query", side_effect=ae.LLMUnavailableError("down")
+        ):
+            payload = build_payload("What does my railway ticket contain?")
+        self.assertFalse(payload["ok"])
+        self.assertIn("Ollama", payload["error_message"])
+        self.assertIn("not reachable", payload["error_message"])
+
+    def test_25_connection_error_shows_ollama_message(self):
+        harness = _StreamlitHarness()
+        with harness, mock.patch.object(
+            ui, "answer_query", side_effect=ConnectionError("refused")
+        ):
+            payload = build_payload("What is my roll number?")
+        self.assertFalse(payload["ok"])
+        self.assertIn("Ollama", payload["error_message"])
+
+    def test_26_transport_down_is_not_reported_as_insufficient(self):
+        """The distinguishing regression: service-down != insufficient-context."""
+        import answer_engine as ae
+
+        harness = _StreamlitHarness()
+        with harness, mock.patch.object(
+            ui, "answer_query", side_effect=ae.LLMUnavailableError("down")
+        ):
+            payload = build_payload("What does my railway ticket contain?")
+        self.assertFalse(payload.get("insufficient"))
+        self.assertIsNone(payload.get("answer"))
+
+    def test_27_hinglish_summary_loading_message(self):
+        """Hinglish summary phrasings get the honest long-run loading state."""
+        self.assertTrue(ui._looks_semantic("Meri railway ticket mein kya details hain?"))
+        self.assertTrue(ui._looks_semantic("ID card ke important details batao"))
+        self.assertTrue(ui._looks_semantic("Meri application form ki important details batao"))
+        # Fact-ish exact queries keep the quick message.
+        self.assertFalse(ui._looks_semantic("Mera roll number kya hai?"))
+
+
+class TestChatFlow(unittest.TestCase):
+    """Phase 10 chat state machine: submit → user bubble → answer below.
+
+    Covers the required interaction cases (first query, second query,
+    consecutive queries, duplicate submission, empty query, fast exact
+    vs slow semantic loading state, Ollama unavailable, previous
+    messages stay visible) at the state-management layer.
+    """
+
+    # -- submission state machine (pure helpers, no Streamlit run) ----
+
+    def test_28_first_query_appends_pending_user_message(self):
+        history: list = []
+        action, entry = ui._prepare_submission(history, "What is my roll number?")
+        self.assertEqual(action, "accepted")
+        self.assertEqual(len(history), 1)
+        self.assertEqual(history[0]["query"], "What is my roll number?")
+        self.assertIsNone(history[0]["payload"])  # answer pending
+        self.assertIs(entry, history[0])
+
+    def test_29_empty_query_rejected_without_recording(self):
+        history: list = []
+        for raw in ("", "   ", None):
+            action, entry = ui._prepare_submission(history, raw)
+            self.assertEqual(action, "empty")
+            self.assertIsNone(entry)
+        self.assertEqual(history, [])
+
+    def test_30_consecutive_identical_query_blocked(self):
+        history = [
+            {"query": "What is my roll number?", "payload": {"ok": True}},
+        ]
+        action, entry = ui._prepare_submission(history, "What is my roll number?")
+        self.assertEqual(action, "duplicate")
+        self.assertIsNone(entry)
+        self.assertEqual(len(history), 1)  # history untouched
+
+    def test_31_second_different_query_appends_after_previous(self):
+        history = [
+            {"query": "What is my roll number?", "payload": {"ok": True}},
+        ]
+        action, _ = ui._prepare_submission(history, "What is my phone number?")
+        self.assertEqual(action, "accepted")
+        self.assertEqual(len(history), 2)
+        self.assertEqual(history[0]["query"], "What is my roll number?")
+        self.assertEqual(history[1]["query"], "What is my phone number?")
+        self.assertEqual(
+            [e["query"] for e in history],
+            ["What is my roll number?", "What is my phone number?"],
+        )  # oldest-first, nothing replaced
+
+    def test_32_history_stays_bounded_oldest_dropped(self):
+        history: list = []
+        for i in range(ui.MAX_HISTORY_ENTRIES + 2):
+            action, _ = ui._prepare_submission(history, f"question {i}")
+            self.assertEqual(action, "accepted")
+        self.assertEqual(len(history), ui.MAX_HISTORY_ENTRIES)
+        self.assertEqual(history[0]["query"], "question 2")
+        self.assertEqual(history[-1]["query"], f"question {ui.MAX_HISTORY_ENTRIES + 1}")
+
+    # -- processing the pending query (spinner + payload attachment) --
+
+    def _answer(self, history, pending, **answer_query_kwargs):
+        harness = _StreamlitHarness()
+        with harness, mock.patch.object(ui, "answer_query", **answer_query_kwargs):
+            ui._answer_pending(history, pending)
+        return harness
+
+    def test_33_fast_exact_query_attaches_payload_exact_loading(self):
+        history = [{"query": "What is my roll number?", "payload": None}]
+        harness = self._answer(
+            history, "What is my roll number?", return_value=make_result()
+        )
+        entry = history[0]
+        self.assertTrue(entry["payload"]["ok"])
+        self.assertIn("2407510100067", entry["payload"]["answer"])
+        self.assertIn("Checking your documents", harness.text_of("spinner"))
+
+    def test_34_slow_semantic_query_gets_honest_loading_message(self):
+        query = "Tell me the important information on my ID card."
+        history = [{"query": query, "payload": None}]
+        harness = self._answer(history, query, return_value=make_result())
+        self.assertIn("Searching your documents", harness.text_of("spinner"))
+        self.assertTrue(history[0]["payload"]["ok"])
+
+    def test_35_ollama_unavailable_becomes_assistant_error_bubble(self):
+        history = [{"query": "What does my railway ticket contain?", "payload": None}]
+        harness = self._answer(
+            history,
+            "What does my railway ticket contain?",
+            side_effect=ConnectionError("refused"),
+        )
+        payload = history[0]["payload"]
+        self.assertFalse(payload["ok"])
+        self.assertIn("Ollama", payload["error_message"])
+        # The user message stays visible above the failed answer.
+        self.assertEqual(history[0]["query"], "What does my railway ticket contain?")
+
+    def test_35b_pending_without_entry_creates_its_own_user_message(self):
+        history: list = []
+        self._answer(history, "What is my roll number?", return_value=make_result())
+        self.assertEqual(len(history), 1)
+        self.assertEqual(history[0]["query"], "What is my roll number?")
+        self.assertTrue(history[0]["payload"]["ok"])
+
+    # -- conversation rendering (previous messages stay visible) ------
+
+    def test_36_conversation_shows_user_and_assistant_messages(self):
+        with mock.patch.object(ui, "answer_query", return_value=make_result()):
+            payload = build_payload("What is my roll number?")
+        history = [{"query": "What is my roll number?", "payload": payload}]
+        harness = _StreamlitHarness()
+        with harness:
+            ui._render_conversation(history)
+        self.assertTrue(harness.called("chat_message"))
+        markdown = harness.text_of("markdown")
+        self.assertIn("What is my roll number?", markdown)  # user bubble
+        self.assertIn("2407510100067", markdown)  # assistant answer below
+        # Details (sources & provenance) expander preserved.
+        self.assertIn("roll", harness.text_of("expander"))
+
+    def test_37_pending_turn_renders_user_bubble_with_waiting_state(self):
+        history = [{"query": "What is my phone number?", "payload": None}]
+        harness = _StreamlitHarness()
+        with harness:
+            ui._render_conversation(history)
+        markdown = harness.text_of("markdown")
+        self.assertIn("What is my phone number?", markdown)  # user bubble first
+        self.assertNotIn("### Answer", markdown)  # no answer yet
+        self.assertIn("Searching your documents", harness.text_of("caption"))
+
+    def test_38_multiple_turns_render_in_order(self):
+        with mock.patch.object(ui, "answer_query", return_value=make_result()):
+            first = build_payload("What is my roll number?")
+        history = [
+            {"query": "What is my roll number?", "payload": first},
+            {"query": "What is my phone number?", "payload": None},
+        ]
+        harness = _StreamlitHarness()
+        with harness:
+            ui._render_conversation(history)
+        markdown = harness.text_of("markdown")
+        self.assertLess(
+            markdown.index("What is my roll number?"),
+            markdown.index("What is my phone number?"),
+        )  # oldest turn first, newest last
+
+    # -- structural guards for the composer rework ---------------------
+
+    def test_39_single_chat_submission_path(self):
+        """Enter key and the send arrow share one code path (st.chat_input);
+        the old text_area + separate Ask-button flow is gone."""
+        source = (PROJECT_ROOT / "src" / "ui.py").read_text(encoding="utf-8")
+        self.assertIn("st.chat_input(", source)
+        self.assertIn("st.chat_message(", source)
+        self.assertNotIn("st.text_area(", source)
+        self.assertNotIn('button("Ask"', source)
+        self.assertEqual(source.count("st.chat_input("), 1)
+
+    def test_40_submitted_query_never_refills_the_input(self):
+        """Regression: the old flow wrote the query back into the widget
+        state (pending_query = query) so text stayed in the box."""
+        source = (PROJECT_ROOT / "src" / "ui.py").read_text(encoding="utf-8")
+        self.assertNotIn('"pending_query"] = query', source)
+        # Both the composer and the example buttons route through the
+        # one shared submission helper.
+        self.assertGreaterEqual(source.count("_prepare_submission("), 3)
+
+
 def main() -> int:
     loader = unittest.TestLoader()
     suite = unittest.TestSuite()
-    for case in (TestBuildPayload, TestRenderResult, TestUIGuards, TestLoadDocuments, TestAskFlow):
+    for case in (
+        TestBuildPayload,
+        TestRenderResult,
+        TestUIGuards,
+        TestLoadDocuments,
+        TestAskFlow,
+        TestOllamaUnavailableHandling,
+        TestChatFlow,
+    ):
         suite.addTests(loader.loadTestsFromTestCase(case))
     runner = unittest.TextTestRunner(verbosity=2)
     result = runner.run(suite)

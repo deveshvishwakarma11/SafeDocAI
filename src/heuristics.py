@@ -71,7 +71,7 @@ DOCUMENT_TYPE_PATTERNS = {
             (r"Semester|सेमेस्टर", "Semester"),
             (r"Result|परिणाम", "Result"),
             (r"Marks|अंक|मार्क्स", "Marks"),
-            (r"Roll\s*No|रोल\s*नンバー", "Roll Number"),
+            (r"Roll\s*No|रोल\s*नंबर", "Roll Number"),
         ],
         "medium_patterns": [
             r"Student|छात्र",

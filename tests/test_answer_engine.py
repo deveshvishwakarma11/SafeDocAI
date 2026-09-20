@@ -492,6 +492,22 @@ def test_answer_query_deterministic_for_repeated_exact_queries() -> None:
     assert strip(first) == strip(second)
 
 
+def test_answer_query_bare_field_exact_no_llm() -> None:
+    """Phase 10.1: a bare field query ("roll number") routes through the
+    deterministic exact path — correct value, grounded, and the LLM is
+    never invoked."""
+    _seed_all()
+    mock = MockLLM('{"answer": "should never be used", "sources": []}')
+    result = answer_engine.answer_query("roll number", llm_fn=mock)
+    assert result["retrieval_route"] == "exact"
+    assert result["llm_called"] is False
+    assert mock.prompts == []  # the LLM was never invoked
+    assert "12345678" in result["answer"]
+    assert result["grounded"] is True
+    assert result["sources"]
+    assert result["insufficient"] is False
+
+
 def test_provenance_fields_in_every_payload() -> None:
     _seed_all()
     exact = answer_engine.answer_query("What is my roll number?")
@@ -549,6 +565,7 @@ def run_all() -> None:
         test_answer_query_empty_retrieval_insufficient_no_llm,
         test_answer_query_fallback_metadata_preserved,
         test_answer_query_deterministic_for_repeated_exact_queries,
+        test_answer_query_bare_field_exact_no_llm,
         test_provenance_fields_in_every_payload,
     ]
 
@@ -595,6 +612,7 @@ def main() -> None:
         test_answer_query_empty_retrieval_insufficient_no_llm,
         test_answer_query_fallback_metadata_preserved,
         test_answer_query_deterministic_for_repeated_exact_queries,
+        test_answer_query_bare_field_exact_no_llm,
         test_provenance_fields_in_every_payload,
     )]
     from _harness import run_tests
