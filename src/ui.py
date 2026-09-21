@@ -47,12 +47,14 @@ try:  # src/ on sys.path (pipeline style)
     from answer_engine import (
         INSUFFICIENT_CONTEXT_MESSAGE,
         LLMUnavailableError,
+        OUT_OF_SCOPE_MESSAGE,
         answer_query,
     )
 except ImportError:  # project root on sys.path
     from src.answer_engine import (
         INSUFFICIENT_CONTEXT_MESSAGE,
         LLMUnavailableError,
+        OUT_OF_SCOPE_MESSAGE,
         answer_query,
     )
     from src import storage_engine
@@ -214,6 +216,7 @@ def build_payload(query: str) -> dict[str, Any]:
         "llm_called": bool(result.get("llm_called")),
         "insufficient": bool(result.get("insufficient")),
         "insufficient_reason": result.get("insufficient_reason"),
+        "scope_reply": bool(result.get("scope_reply")),
         "retrieved_chunks": result.get("retrieved_chunks"),
         "timings_ms": result.get("timings_ms") or {},
         "document_intent": None,
@@ -242,6 +245,7 @@ def _failure_payload(message: str) -> dict[str, Any]:
         "llm_called": False,
         "insufficient": False,
         "insufficient_reason": None,
+        "scope_reply": False,
         "retrieved_chunks": None,
         "timings_ms": {},
         "document_intent": None,
@@ -318,6 +322,15 @@ def render_result(payload: dict[str, Any]) -> None:
 
     answer = payload.get("answer") or ""
 
+    # -- Out-of-scope reply (clearly general/unrelated queries) -------
+    # An honest scope statement from the engine — shown as-is, with no
+    # provenance and no Grounded line (nothing was retrieved).
+    if payload.get("scope_reply") or (
+        answer.strip() == OUT_OF_SCOPE_MESSAGE
+    ):
+        st.info(answer)
+        return
+
     # -- Insufficient context (never invent an answer in the UI) ----
     if payload.get("insufficient") or (
         answer.strip() == INSUFFICIENT_CONTEXT_MESSAGE
@@ -340,14 +353,18 @@ def render_result(payload: dict[str, Any]) -> None:
     if files:
         st.markdown(f"**Source:** {', '.join(files)}")
 
-    grounded_line = "Yes ✅" if payload.get("grounded") else "No ⚠️"
-    total_ms = (payload.get("timings_ms") or {}).get("total")
-    elapsed_line = (
-        f"   ·   {ELAPSED_CAPTION.format(seconds=total_ms / 1000)}"
-        if isinstance(total_ms, (int, float)) and total_ms
-        else ""
-    )
-    st.caption(f"Grounded: {grounded_line}{elapsed_line}")
+    # Conversation responses are ordinary assistant messages: no
+    # Grounded line (nothing was retrieved or validated) and — via the
+    # empty sources above — no Details (sources & provenance) expander.
+    if str(payload.get("classification") or "") != "conversation":
+        grounded_line = "Yes ✅" if payload.get("grounded") else "No ⚠️"
+        total_ms = (payload.get("timings_ms") or {}).get("total")
+        elapsed_line = (
+            f"   ·   {ELAPSED_CAPTION.format(seconds=total_ms / 1000)}"
+            if isinstance(total_ms, (int, float)) and total_ms
+            else ""
+        )
+        st.caption(f"Grounded: {grounded_line}{elapsed_line}")
 
     note = _fallback_note(payload)
     if note:

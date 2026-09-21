@@ -37,6 +37,7 @@ import time
 from typing import Any
 
 try:  # src/ on sys.path (pipeline style)
+    from conversation import check_conversation_intent, out_of_scope_response
     from language import (
         LANG_ENGLISH,
         LANG_HINGLISH,
@@ -47,6 +48,7 @@ try:  # src/ on sys.path (pipeline style)
     from query_relevance import check_query_relevance
     from query_router import route_query
 except ImportError:  # project root on sys.path (test/tooling style)
+    from src.conversation import check_conversation_intent, out_of_scope_response
     from src.language import (
         LANG_ENGLISH,
         LANG_HINGLISH,
@@ -72,6 +74,7 @@ class LLMUnavailableError(RuntimeError):
 __all__ = [
     "INSUFFICIENT_CONTEXT_MESSAGE",
     "LLMUnavailableError",
+    "OUT_OF_SCOPE_MESSAGE",
     "ANSWER_NUM_PREDICT",
     "answer_query",
     "build_answer_from_exact",
@@ -124,6 +127,11 @@ SUMMARY_NUM_PREDICT = 384
 # Document VALUES are never translated -- only the connective wording
 # around them changes with the user's detected language.
 # ------------------------------------------------------------
+
+#: Honest scope reply for clearly general/unrelated queries (no doc
+#: signal, no conversation intent). Replaces the misleading
+#: "not found in your documents" wording for that category.
+OUT_OF_SCOPE_MESSAGE = out_of_scope_response(LANG_ENGLISH)
 
 #: Insufficient-context message per detected language.
 INSUFFICIENT_CONTEXT_BY_LANGUAGE: dict[str, str] = {
@@ -857,11 +865,45 @@ def answer_query(
     if not gate["related"]:
         language = detect_language(query)
         gate_ms = round((time.perf_counter() - started) * 1000, 3)
+
+        # ---- Phase 10.1: local conversation layer --------------------
+        # Pure small talk (hello / thanks / bye / help ...) that the
+        # gate rejected gets a localized conversational response. The
+        # matcher's hijack guard (document-scope tokens -> None) means
+        # a document query can NEVER land here; retrieval/grounding/
+        # provenance for document queries are untouched.
+        conversation = check_conversation_intent(query)
+        if conversation is not None:
+            return {
+                "query": query,
+                "answer": conversation["response"],
+                "sources": [],
+                "source_documents": [],
+                "retrieval_route": "none",
+                "classification": "conversation",
+                "conversation_intent": conversation["intent"],
+                "fallback": {"occurred": False, "reason": None},
+                "grounded": True,
+                "llm_called": False,
+                "insufficient": False,
+                "retrieval_performed": False,
+                "reason": "conversation_intent",
+                "relevance": gate,
+                "language": conversation["language"],
+                "timings_ms": {
+                    "router": 0.0,
+                    "retrieval": None,
+                    "llm_generation": None,
+                    "total": gate_ms,
+                },
+            }
+
+        # Clearly general/unrelated (weather, math, general knowledge):
+        # an honest scope statement instead of the misleading
+        # insufficient-documents message. Still zero retrieval/LLM.
         return {
             "query": query,
-            "answer": INSUFFICIENT_CONTEXT_BY_LANGUAGE.get(
-                language, INSUFFICIENT_CONTEXT_MESSAGE
-            ),
+            "answer": out_of_scope_response(language),
             "sources": [],
             "source_documents": [],
             "retrieval_route": "none",
@@ -869,10 +911,11 @@ def answer_query(
             "fallback": {"occurred": False, "reason": None},
             "grounded": False,
             "llm_called": False,
-            "insufficient": True,
+            "insufficient": False,
             "retrieval_performed": False,
             "reason": gate["reason"],
             "relevance": gate,
+            "scope_reply": True,
             "language": language,
             "timings_ms": {
                 "router": 0.0,

@@ -37,6 +37,7 @@ from _harness import redirect_storage_to_temp, restore_storage, run_tests, seed_
 
 from answer_engine import (
     INSUFFICIENT_CONTEXT_MESSAGE,
+    OUT_OF_SCOPE_MESSAGE,
     answer_query,
     build_answer_from_exact,
     build_semantic_prompt,
@@ -208,7 +209,11 @@ def test_gate_rejects_without_retrieval_in_answer_query() -> None:
     assert payload["classification"] == "rejected"
     assert payload["grounded"] is False
     assert payload["sources"] == []
-    assert payload["answer"] == INSUFFICIENT_CONTEXT_MESSAGE
+    # Phase 10.1: general/unrelated queries get the honest scope reply
+    # (never the misleading insufficient-documents message).
+    assert payload["answer"] == OUT_OF_SCOPE_MESSAGE
+    assert payload["scope_reply"] is True
+    assert payload["insufficient"] is False
     assert payload["timings_ms"]["total"] < 50, (
         f"gate reject must be fast, got {payload['timings_ms']['total']} ms"
     )
@@ -498,6 +503,89 @@ def test_provenance_fields_preserved_on_semantic() -> None:
         assert key in payload
     assert payload["retrieval_route"] == "semantic"
     assert payload["grounded"] is True
+
+
+# ===========================================================================
+# Phase 10.1: conversation layer + scope replies (via answer_query)
+# ===========================================================================
+
+
+def test_conversation_greeting_no_retrieval_no_llm() -> None:
+    """'hello' answers locally: no SQLite, no Chroma, no Ollama call."""
+
+    _seed_all()
+    mock = MockLLM('{"answer": "unused", "sources": []}')
+    payload = answer_query("hello", llm_fn=mock)
+
+    assert mock.calls == 0, "conversation must never reach the LLM"
+    assert payload["classification"] == "conversation"
+    assert payload["conversation_intent"] == "greeting"
+    assert payload["retrieval_route"] == "none"
+    assert payload["retrieval_performed"] is False
+    assert payload["llm_called"] is False
+    assert payload["grounded"] is True
+    assert payload["insufficient"] is False
+    assert payload["reason"] == "conversation_intent"
+    assert "SafeDocAI" in payload["answer"]
+    assert payload["timings_ms"]["total"] < 50
+
+
+def test_conversation_capabilities_explains_documents() -> None:
+    payload = answer_query("what can you do?", llm_fn=MockLLM("unused"))
+    assert payload["classification"] == "conversation"
+    assert payload["conversation_intent"] == "capabilities"
+    assert "documents" in payload["answer"].lower()
+    assert payload["sources"] == []
+
+
+def test_conversation_hinglish_response_localized() -> None:
+    payload = answer_query("shukriya", llm_fn=MockLLM("unused"))
+    assert payload["classification"] == "conversation"
+    assert payload["conversation_intent"] == "thanks"
+    assert payload["language"] == LANG_HINGLISH
+    assert "documents" in payload["answer"].lower()
+
+
+def test_conversation_thanks_with_document_signal_stays_document_query() -> None:
+    """'thanks, what is my dob?' must reach the document pipeline."""
+
+    _seed_all()
+    mock = MockLLM('{"answer": "unused", "sources": []}')
+    payload = answer_query("thanks, what is my dob?", llm_fn=mock)
+
+    assert payload["classification"] != "conversation"
+    assert "conversation_intent" not in payload
+    assert "1985" in payload["answer"] or payload["retrieval_route"] == "exact"
+
+
+def test_out_of_scope_uses_scope_reply_not_insufficient() -> None:
+    """'weather today' / '2 + 2' get the scope-aware reply, zero retrieval."""
+
+    for query in ("weather today", "2 + 2", "latest cricket score"):
+        mock = MockLLM('{"answer": "unused", "sources": []}')
+        payload = answer_query(query, llm_fn=mock)
+        assert payload["answer"] == OUT_OF_SCOPE_MESSAGE, query
+        assert payload["scope_reply"] is True
+        assert payload["classification"] == "rejected"
+        assert payload["insufficient"] is False
+        assert payload["retrieval_performed"] is False
+        assert payload["llm_called"] is False
+        assert mock.calls == 0
+        assert payload["reason"] == "query_outside_document_scope"
+
+
+def test_document_query_unchanged_by_conversation_layer() -> None:
+    """A document query keeps byte-identical provenance behavior."""
+
+    _seed_all()
+    payload = answer_query("What is my roll number?", llm_fn=MockLLM("unused"))
+    assert payload["retrieval_route"] == "exact"
+    assert "2407510100067" in payload["answer"]
+    assert payload["classification"] != "conversation"
+    assert "conversation_intent" not in payload
+    assert "scope_reply" not in payload
+    for key in ("sources", "source_documents", "retrieval_route", "grounded"):
+        assert key in payload
 
 
 # ===========================================================================

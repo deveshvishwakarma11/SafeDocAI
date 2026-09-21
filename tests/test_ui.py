@@ -575,6 +575,65 @@ class TestChatFlow(unittest.TestCase):
         self.assertGreaterEqual(source.count("_prepare_submission("), 3)
 
 
+class TestConversationRendering(unittest.TestCase):
+    """Phase 10.1: conversation + scope replies render naturally."""
+
+    def test_41_conversation_renders_without_grounded_line(self):
+        result = make_result(
+            answer="Hello! I'm SafeDocAI — ask me anything about the documents "
+            "stored on this machine.",
+            classification="conversation",
+            retrieval_route="none",
+            grounded=True,
+            llm_called=False,
+            sources=[],
+            source_documents=[],
+        )
+        harness = _StreamlitHarness()
+        with harness, mock.patch.object(ui, "answer_query", return_value=result):
+            render_result(build_payload("hello"))
+        self.assertIn("SafeDocAI", harness.text_of("markdown"))
+        # Ordinary assistant message: no Grounded line, no provenance
+        # expander, no error — nothing was retrieved or validated.
+        self.assertNotIn("Grounded:", harness.text_of("caption"))
+        self.assertFalse(harness.called("expander"))
+        self.assertFalse(harness.called("error"))
+
+    def test_42_conversation_payload_normalized(self):
+        result = make_result(
+            classification="conversation",
+            retrieval_route="none",
+            sources=[],
+            source_documents=[],
+        )
+        with mock.patch.object(ui, "answer_query", return_value=result):
+            payload = build_payload("hi")
+        self.assertTrue(payload["ok"])
+        self.assertEqual(payload["classification"], "conversation")
+        self.assertFalse(payload["insufficient"])
+        self.assertFalse(payload["scope_reply"])
+
+    def test_43_scope_reply_shown_as_info_without_provenance(self):
+        result = make_result(
+            answer=ui.OUT_OF_SCOPE_MESSAGE,
+            classification="rejected",
+            retrieval_route="none",
+            grounded=False,
+            llm_called=False,
+            sources=[],
+            source_documents=[],
+            scope_reply=True,
+        )
+        harness = _StreamlitHarness()
+        with harness, mock.patch.object(ui, "answer_query", return_value=result):
+            render_result(build_payload("weather today"))
+        info = harness.text_of("info")
+        self.assertIn("documents stored on this machine", info)
+        self.assertIn("out of", info)
+        self.assertNotIn("Grounded:", harness.text_of("caption"))
+        self.assertFalse(harness.called("expander"))
+
+
 def main() -> int:
     loader = unittest.TestLoader()
     suite = unittest.TestSuite()
@@ -586,6 +645,7 @@ def main() -> int:
         TestAskFlow,
         TestOllamaUnavailableHandling,
         TestChatFlow,
+        TestConversationRendering,
     ):
         suite.addTests(loader.loadTestsFromTestCase(case))
     runner = unittest.TextTestRunner(verbosity=2)
