@@ -34,6 +34,7 @@ import re
 from typing import Any
 
 from candidate_extractor import (
+    Candidate,
     extract_candidates_for_window_with_stats,
     has_usable_candidates,
 )
@@ -48,6 +49,10 @@ from selection_budget import (
     split_candidate_ids,
     truncation_retry_plan,
 )
+try:  # src/ on sys.path (pipeline style)
+    from document_evidence import discover_identifier_fields
+except ImportError:  # project root on sys.path (test/tooling style)
+    from src.document_evidence import discover_identifier_fields
 
 logger = logging.getLogger("SafeDocAI.Selection")
 
@@ -97,6 +102,30 @@ def _usable_window_text(window: str) -> bool:
     """A window is usable when it carries real OCR text (not only markers)."""
     return bool(_slice_text(window).strip())
 
+
+def _identifier_candidates(
+    raw_text: str,
+    window_start: int,
+    window_end: int,
+) -> list[dict[str, Any]]:
+    """Structural identifier candidates for this window's region (Step 2).
+
+    Uses the generic structural-layout discovery in
+    ``document_evidence.discover_identifier_fields`` (header-row tables and
+    caption-below values, which the line-based label:value extractor cannot
+    see) and keeps only discoveries whose value starts inside
+    ``[window_start, window_end)``. ``char_span`` values are absolute.
+    """
+
+    if window_end <= window_start or window_end > len(raw_text):
+        return []
+
+    discovered = discover_identifier_fields(raw_text)
+    return [
+        record
+        for record in discovered
+        if window_start <= record["char_span"][0] < window_end
+    ]
 
 # ---------------------------------------------------------------------------
 # Per-window selection
@@ -170,13 +199,44 @@ def select_window(
         c.id: c.to_dict() for c in candidates
     }
 
+    # --- Step 2: deterministic identifier candidates (priority offer) ------
+    # Generic structural layouts (header-row tables, caption-below values)
+    # are invisible to the line-based extractor above. Structural identifier
+    # candidates are APPENDED with higher ids and offered FIRST, so a
+    # bounded budget always spends on them before line-based candidates;
+    # every candidate is still offered exactly once. Both pools pass through
+    # the same defensive response validation, and the evidence validator
+    # remains the sole authority for what gets stored.
+    identifier_candidates = _identifier_candidates(raw_text, window_start, window_end)
+    priority_ids: list[str] = []
+    if identifier_candidates:
+        next_id = len(candidate_dicts)
+        for record in identifier_candidates:
+            entry = {
+                "id": next_id,
+                "label": record["family"],
+                "value": record["value"],
+                "line_no": record["line_no"],
+                "char_span": record["char_span"],
+            }
+            candidate_dicts.append(entry)
+            id_to_candidate[next_id] = entry
+            priority_ids.append(str(next_id))
+            next_id += 1
+        logger.info(
+            "Identifier candidates discovered in window [%d:%d): %s",
+            window_start,
+            window_end,
+            [(c["family"], c["value"]) for c in identifier_candidates],
+        )
+
     # --- Approved planner: slices, budget, K --------------------------------
     plan: SelectionPlan = plan_selection_calls(len(candidate_dicts))
 
     if plan.total_calls == 0:
         raise SelectionUnavailable("planner produced no calls")
 
-    offered_ids = [str(c.id) for c in candidates]
+    offered_ids = priority_ids + [str(c.id) for c in candidates]
     slices = split_candidate_ids(offered_ids, plan.slice_sizes)
 
     # --- Bounded selection calls with truncation retry ----------------------

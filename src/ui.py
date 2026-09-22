@@ -15,6 +15,13 @@ is appended below it as an assistant bubble. Previous turns stay
 visible for the whole UI session and new queries append instead of
 replacing anything.
 
+Step 1 (conversation state): the chat history is additionally mirrored
+into a bounded, memory-only ``ConversationState`` (st.session_state)
+and passed to ``answer_engine.answer_query`` as READ-ONLY context.
+This changes nothing visible: no rendering, routing or loading change,
+and the engine does not yet interpret the context (that is a later
+roadmap step). Clearing the conversation clears the state too.
+
 Privacy:
 * Local filesystem paths only; Ollama on localhost only.
 * No external frontend assets, analytics, or remote APIs.
@@ -50,6 +57,7 @@ try:  # src/ on sys.path (pipeline style)
         OUT_OF_SCOPE_MESSAGE,
         answer_query,
     )
+    from conversation_state import ConversationState
 except ImportError:  # project root on sys.path
     from src.answer_engine import (
         INSUFFICIENT_CONTEXT_MESSAGE,
@@ -58,6 +66,7 @@ except ImportError:  # project root on sys.path
         answer_query,
     )
     from src import storage_engine
+    from src.conversation_state import ConversationState
 
 import streamlit as st
 
@@ -156,8 +165,18 @@ def load_documents() -> list[dict[str, Any]]:
 # ============================================================
 
 
-def build_payload(query: str) -> dict[str, Any]:
+def build_payload(
+    query: str,
+    context: dict[str, Any] | ConversationState | None = None,
+) -> dict[str, Any]:
     """Normalize any answer_query() outcome into a UI-friendly payload.
+
+    Step 1 (conversation state): the optional ``context`` — a
+    :class:`conversation_state.ConversationState` or an already-built
+    context dict — is forwarded to :func:`answer_engine.answer_query`
+    unchanged. It is READ-ONLY plumbing: it never alters classification,
+    routing, retrieval, answers or rendering. When ``None`` the engine
+    call is exactly the pre-Step-1 call.
 
     Never raises and never fabricates: every failure mode (transport
     down, malformed result, unexpected shape) degrades to a payload
@@ -167,7 +186,7 @@ def build_payload(query: str) -> dict[str, Any]:
     started = time.perf_counter()
 
     try:
-        result = answer_query(query)
+        result = answer_query(query, context=context)
     except (ConnectionError, LLMUnavailableError):
         # The local model transport is unreachable (llm_engine raises
         # ConnectionError via health paths; the semantic generation path
@@ -228,6 +247,22 @@ def build_payload(query: str) -> dict[str, Any]:
     if isinstance(result.get("document_intent"), dict):
         normalized["document_intent"] = result["document_intent"]
 
+    # Step 1 provenance: whether conversation context was available to
+    # the engine for this query. Display-only metadata; nothing renders
+    # from it yet (context-aware interpretation is a later step).
+    normalized["context_present"] = bool(
+        result.get("context")
+    )
+
+    # Step 4 provenance: the structured clarification result (needed /
+    # question / options / reason) when the engine asked ONE question
+    # instead of guessing. Display-only; rendering reads it in
+    # render_result; nothing else consumes it here.
+    clarification = result.get("clarification")
+    normalized["clarification"] = (
+        dict(clarification) if isinstance(clarification, dict) else None
+    )
+
     return normalized
 
 
@@ -249,6 +284,8 @@ def _failure_payload(message: str) -> dict[str, Any]:
         "retrieved_chunks": None,
         "timings_ms": {},
         "document_intent": None,
+        "context_present": False,
+        "clarification": None,
         "ui_total_ms": None,
     }
 
@@ -321,6 +358,14 @@ def render_result(payload: dict[str, Any]) -> None:
         return
 
     answer = payload.get("answer") or ""
+
+    # -- Clarification (Step 4: ask ONE question instead of guessing) --
+    # Rendered as a plain assistant message (st.info): no Grounded line,
+    # no provenance expander — nothing was retrieved or validated. The
+    # user's reply is just the next normal turn.
+    if str(payload.get("classification") or "") == "clarification":
+        st.info(answer)
+        return
 
     # -- Out-of-scope reply (clearly general/unrelated queries) -------
     # An honest scope statement from the engine — shown as-is, with no
@@ -467,6 +512,7 @@ def run_app() -> None:
             for key in (
                 "chat_history", "history",  # current + legacy history keys
                 "pending_query", "query_input", "_scroll_pending",
+                "conversation_state",  # Step 1 engine-side state (memory only)
             ):
                 st.session_state.pop(key, None)
             st.rerun()
@@ -578,6 +624,31 @@ def _prepare_submission(
     return "accepted", entry
 
 
+def _get_conversation_state() -> ConversationState:
+    """Session-scoped conversation state (created once, bounded).
+
+    Step 1: lives ONLY in ``st.session_state`` — never persisted to
+    SQLite, ChromaDB, files or the data/ directory. The bound mirrors
+    MAX_HISTORY_ENTRIES so the engine-side state cannot outgrow the
+    visible chat history.
+
+    Degrades safely outside a real Streamlit runtime (direct function
+    calls, test harnesses, tooling): a transient memory-only state is
+    returned instead of raising. Nothing is ever persisted anywhere.
+    """
+
+    try:
+        state = st.session_state.get("conversation_state")
+        if not isinstance(state, ConversationState):
+            state = ConversationState(max_turns=MAX_HISTORY_ENTRIES)
+            st.session_state["conversation_state"] = state
+        return state
+    except TypeError:
+        # No usable session_state in this runtime: transient state for
+        # this call only (memory-only, discarded afterwards).
+        return ConversationState(max_turns=MAX_HISTORY_ENTRIES)
+
+
 def _answer_pending(history: list[dict[str, Any]], pending: str) -> None:
     """Process ``pending`` and attach the assistant payload to its entry.
 
@@ -604,13 +675,36 @@ def _answer_pending(history: list[dict[str, Any]], pending: str) -> None:
 
     # Deterministic transient retry for transport hiccups (unchanged).
     loading = SEMANTIC_LOADING_TEXT if _looks_semantic(pending) else EXACT_LOADING_TEXT
+
+    # Step 1: build the READ-ONLY conversation context from the session's
+    # conversation state (history-derived, bounded, memory-only). The
+    # current query is NOT yet in the state at this point: it becomes a
+    # turn only after its answer exists, so the context always describes
+    # the turns BEFORE this query. With no prior turns the engine gets
+    # context=None — its exact pre-Step-1 call. Nothing interprets it.
+    state: ConversationState = _get_conversation_state()
+    context: dict[str, Any] | None = (
+        state.to_context() if not state.is_empty() else None
+    )
+
     payload: dict[str, Any] | None = None
     for attempt in range(1, MAX_TRANSIENT_RETRIES + 1):
         with st.spinner(loading):
-            payload = build_payload(pending)
+            payload = build_payload(pending, context=context)
         if payload.get("ok") or attempt == MAX_TRANSIENT_RETRIES:
             break
     entry["payload"] = payload
+
+    # Step 1: record the completed turn in the bounded, memory-only
+    # conversation state (display language comes from the payload when
+    # the engine reported one; no re-detection happens here). Language
+    # behavior itself is untouched — detection still lives in the engine.
+    language = payload.get("language") if isinstance(payload, dict) else None
+    state.add_turn(
+        pending,
+        payload.get("answer", "") if isinstance(payload, dict) else "",
+        language if isinstance(language, str) else None,
+    )
 
 
 def _render_conversation(history: list[dict[str, Any]]) -> None:

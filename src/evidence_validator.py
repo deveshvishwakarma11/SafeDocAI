@@ -16,6 +16,19 @@ import re
 import unicodedata
 from typing import Any
 
+try:  # src/ on sys.path (pipeline style)
+    from document_evidence import (
+    claim_is_contradicted,
+    family_evidence_score,
+    normalize_family_name,
+)
+except ImportError:  # project root on sys.path (test/tooling style)
+    from src.document_evidence import (
+        claim_is_contradicted,
+        family_evidence_score,
+        normalize_family_name,
+    )
+
 
 def normalize_for_comparison(text: str) -> str:
     """
@@ -463,6 +476,28 @@ def validate_document_type(
     type_normalized = normalize_value_for_matching(document_type)
     evidence_normalized = normalize_for_comparison(evidence_text)
     
+    # Step 2: evidence-contradiction guard FIRST.
+    # A claim resting on one boilerplate indicator word ("Voter Identity
+    # Card / Passport / PAN Card ..." in ticket terms; "... results ..."
+    # in form declarations) must not verify when another document
+    # family's strong evidence dominates the same text. This runs BEFORE
+    # the indicator table so a wrong family can never early-return True.
+    if claim_is_contradicted(evidence_text, document_type):
+        return (document_type, False)
+
+    # Step 2: registry-family claims verify on their OWN strong evidence
+    # (>= 2 strong hits), independent of a literal phrase match. Free-form
+    # ("Railway Ticket") and registry ("RAILWAY_TICKET") spellings both
+    # normalize to the same family. Wrong-family claims never reach here:
+    # the contradiction guard above already rejected them.
+    claimed_family = normalize_family_name(document_type)
+    if claimed_family is not None:
+        strong_hits, _medium_hits = family_evidence_score(
+            evidence_text, claimed_family
+        )
+        if strong_hits >= 2:
+            return (document_type, True)
+
     # Check if the document type appears in the evidence
     # This is a basic check - more sophisticated validation could
     # look for type-specific patterns

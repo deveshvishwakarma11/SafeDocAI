@@ -48,6 +48,11 @@ from evidence_validator import (
     validate_fields,
 )
 
+from document_evidence import (
+    claim_is_contradicted,
+    priority_identifier_fields,
+)
+
 from storage_engine import (
     store_understanding_results,
     get_db_connection,
@@ -59,6 +64,67 @@ from selection_engine import (
     position_aware_merge,
     select_window,
 )
+
+
+def _normalize_field_key(key: Any) -> str:
+    """Step 2: same key normalization as the evidence layer's family keys."""
+
+    return re.sub(r"[\s_\-]+", " ", str(key)).strip().casefold()
+
+
+def _merge_priority_identifier_fields(
+    validated_fields: list[dict[str, Any]],
+    raw_text: str,
+) -> list[dict[str, Any]]:
+    """Step 2: merge evidence-validated structural identifiers (generic).
+
+    ``document_evidence.priority_identifier_fields`` discovers identifier
+    fields from structural layouts the line-based candidate extractor cannot
+    see (header-row tables, caption-below values), then re-validates every
+    candidate against the ORIGINAL OCR text with the authoritative evidence
+    validator: validation failure means the field is dropped, never stored.
+
+    Merge policy (no per-document-type logic):
+    * a family already present AND verified is never duplicated/overridden;
+    * a same-family field that failed validation (unverified) is replaced by
+      the evidence-verified candidate (strictly better grounding);
+    * absent families are added with ``verified: True``.
+    """
+
+    verified_fields = [
+        field for field in validated_fields if field.get("verified", False)
+    ]
+
+    try:
+        priority_fields = priority_identifier_fields(
+            raw_text,
+            existing_fields=verified_fields,
+        )
+    except Exception as exc:  # defensive: never break the main pipeline
+        logger.warning("Priority identifier merge failed: %s", exc)
+        return validated_fields
+
+    if not priority_fields:
+        return validated_fields
+
+    priority_keys = {
+        _normalize_field_key(field["key"]) for field in priority_fields
+    }
+    merged = [
+        field
+        for field in validated_fields
+        if not (
+            _normalize_field_key(field.get("key", "")) in priority_keys
+            and not field.get("verified", False)
+        )
+    ]
+    merged.extend(priority_fields)
+
+    logger.info(
+        "Priority identifier fields merged: %s",
+        [(f["key"], f["value"]) for f in priority_fields],
+    )
+    return merged
 
 
 def get_document_id_from_db(file_path: str | Path) -> int | None:
@@ -897,6 +963,14 @@ def process_document(
             require_all_verified=False,
         )
 
+        # Step 2: generic structural identifier merge (evidence-verified
+        # only) -- the heuristic-only fallback still reports identifiers
+        # such as PNR when the OCR evidence supports them.
+        validated_fields = _merge_priority_identifier_fields(
+            validated_fields,
+            raw_text,
+        )
+
         final_understanding = {
             "document_type": merged["document_type"],
             "summary": merged["summary"],
@@ -1020,6 +1094,14 @@ def process_document(
         require_all_verified=False,  # Keep unverified fields but mark them
     )
 
+    # Step 2: generic structural identifier merge (evidence-verified only).
+    # Runs AFTER the authoritative validate_fields so every merged value is
+    # itself evidence-validated against the ORIGINAL OCR text.
+    validated_fields = _merge_priority_identifier_fields(
+        validated_fields,
+        raw_text,
+    )
+
     verified_count = sum(
         1 for f in validated_fields if f.get("verified", False)
     )
@@ -1053,11 +1135,21 @@ def process_document(
         is_high_confidence_classification(heuristic_confidence)
         and heuristic_type != "UNKNOWN"
     ):
-        # Heuristic is high-confidence - can use as fallback
-        # Only if it matches the (unverified) LLM type or LLM is UNKNOWN
+        # Heuristic is high-confidence - can use as fallback.
+        # Usable when the LLM claim is UNKNOWN, agrees with the heuristic,
+        # or was actively CONTRADICTED by strong evidence of another family
+        # (Step 2: e.g. a ticket's boilerplate "Voter Identity Card" claim
+        # vs. the registry family that actually dominates the text). This
+        # stays fully generic: the rule is evidence-based, not per-type.
+        llm_claim_contradicted = (
+            validated_llm_type != "UNKNOWN"
+            and not llm_type_verified
+            and claim_is_contradicted(raw_text, validated_llm_type)
+        )
         if (
             validated_llm_type == "UNKNOWN"
             or validated_llm_type.upper() == heuristic_type.upper()
+            or llm_claim_contradicted
         ):
             final_document_type = heuristic_type
             if classification_source == "LLM":

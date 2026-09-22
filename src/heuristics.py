@@ -21,6 +21,11 @@ from __future__ import annotations
 import re
 from typing import Any, Tuple
 
+try:  # src/ on sys.path (pipeline style)
+    from document_evidence import classify_new_families
+except ImportError:  # project root on sys.path (test/tooling style)
+    from src.document_evidence import classify_new_families
+
 
 # ============================================================================
 # Document Type Classification
@@ -174,6 +179,12 @@ def _classify_core(text: str) -> tuple[str, float, int, int]:
     """
     Core classification logic shared by the tuple and dict APIs.
 
+    Step 2: document families registered in the generic evidence registry
+    (document_evidence.NEW_DOCUMENT_TYPE_EVIDENCE) are classified FIRST;
+    they win on strong multi-token evidence combinations and shield their
+    families from weak single-keyword claims of legacy types. The legacy
+    table still classifies everything else exactly as before.
+
     Returns:
         (document_type, confidence, strong_matches, medium_matches)
     """
@@ -181,6 +192,16 @@ def _classify_core(text: str) -> tuple[str, float, int, int]:
         return ("UNKNOWN", 0.0, 0, 0)
 
     text_normalized = normalize_text(text)
+
+    # --- Step 2: evidence-registry families take priority ---------------
+    registry = classify_new_families(text)
+    if registry is not None:
+        return (
+            registry["document_type"],
+            registry["confidence"],
+            registry["strong_matches"],
+            registry["medium_matches"],
+        )
 
     best_type = "UNKNOWN"
     best_score = 0.0
@@ -280,6 +301,31 @@ def get_document_type_confidence(
     doc_type, confidence, strong, medium = _classify_core(text)
     text_normalized = normalize_text(text)
 
+    # Step 2: strict negative guard for the MARKSHEET family. Application
+    # forms declare eligibility/results/graduation in their boilerplate
+    # without any marksheet-specific evidence; do not let those words
+    # produce (or support) a marksheet claim.
+    if doc_type == "MARKSHEET":
+        has_marksheet_evidence = re.search(
+            r"\b(sgpa|cgpa|semester|marksheet|marks\s+sheet)\b",
+            text_normalized,
+            re.IGNORECASE,
+        )
+        has_form_evidence = re.search(
+            r"\b(application\s+form|applicant|eligibility|paper\s+code|"
+            r"examination\s+body|provisional\s+application)\b",
+            text_normalized,
+            re.IGNORECASE,
+        )
+        if has_form_evidence and not has_marksheet_evidence:
+            return {
+                "document_type": "UNKNOWN",
+                "confidence": 0.0,
+                "strong_matches": 0,
+                "medium_matches": 0,
+                "evidence_details": [],
+            }
+
     if doc_type == "UNKNOWN":
         return {
             "document_type": "UNKNOWN",
@@ -287,6 +333,30 @@ def get_document_type_confidence(
             "strong_matches": 0,
             "medium_matches": 0,
             "evidence_details": [],
+        }
+
+    # Step 2: registry families live in document_evidence, not in the
+    # legacy pattern table -- collect their evidence details from there.
+    if doc_type not in DOCUMENT_TYPE_PATTERNS:
+        from document_evidence import (
+            NEW_DOCUMENT_TYPE_EVIDENCE,
+            score_evidence_patterns,
+        )
+
+        family = NEW_DOCUMENT_TYPE_EVIDENCE[doc_type]
+        return {
+            "document_type": doc_type,
+            "confidence": round(confidence, 3),
+            "strong_matches": strong,
+            "medium_matches": medium,
+            "evidence_details": [
+                *_collect_evidence_details(
+                    text_normalized, family["strong_patterns"], "strong"
+                ),
+                *_collect_evidence_details(
+                    text_normalized, family["medium_patterns"], "medium"
+                ),
+            ],
         }
 
     evidence_details = [

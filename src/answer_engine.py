@@ -38,6 +38,7 @@ from typing import Any
 
 try:  # src/ on sys.path (pipeline style)
     from conversation import check_conversation_intent, out_of_scope_response
+    from conversation_state import ConversationState
     from language import (
         LANG_ENGLISH,
         LANG_HINGLISH,
@@ -49,6 +50,7 @@ try:  # src/ on sys.path (pipeline style)
     from query_router import route_query
 except ImportError:  # project root on sys.path (test/tooling style)
     from src.conversation import check_conversation_intent, out_of_scope_response
+    from src.conversation_state import ConversationState
     from src.language import (
         LANG_ENGLISH,
         LANG_HINGLISH,
@@ -832,12 +834,23 @@ def answer_query(
     top_k: int = 3,
     max_distance: float | None = None,
     llm_fn=None,
+    *,
+    context: dict[str, Any] | ConversationState | None = None,
 ) -> dict[str, Any]:
     """Answer a natural-language question with full grounding + provenance.
 
     EXACT route  -> deterministic answer from SQLite; no LLM call.
     SEMANTIC route -> one local Ollama call over the retrieved chunks,
     then deterministic grounding validation against those same chunks.
+
+    Step 1 (conversation state): the optional ``context`` parameter makes
+    previous conversation turns available to the engine as READ-ONLY
+    context only. This step deliberately does NOT use the context to
+    change any classification, routing, retrieval or answer decision —
+    context-aware interpretation (clarification, follow-ups, pronoun
+    resolution) is a later roadmap step. Callers that omit ``context``
+    (or pass ``None``) get behavior identical to before: a ``None``
+    context is echoed as ``"context": None`` and nothing else changes.
 
     Args:
         query: The user's question.
@@ -849,13 +862,92 @@ def answer_query(
         llm_fn: Testing hook. Defaults to :func:`_generate_semantic_answer`.
             Any replacement must keep the same contract: return a
             validated payload dict or None (never raise, never fabricate).
+        context: Optional conversation context from :mod:`conversation_state`
+            — either a :class:`conversation_state.ConversationState` (its
+            ``to_context()`` dict is used) or an already-built context dict
+            (as emitted by ``ConversationState.to_context()``). Read-only:
+            this call never mutates it.
 
     Never invents content: anything unusable becomes an explicit
     insufficient result. Fallback information from the router is
     preserved in the final result.
     """
 
+    # Step 1: normalize the optional conversation context ONCE, before any
+    # processing. No interpretation, no mutation of the caller's object.
+    if isinstance(context, ConversationState):
+        context_snapshot: dict[str, Any] | None = context.to_context()
+    else:
+        context_snapshot = context
+
     started = time.perf_counter()
+
+    # Step 3: compute the unified structured request ONCE, deterministically
+    # (no LLM, no I/O), and attach it to every returned payload. This does
+    # NOT change any decision: routing/retrieval/grounding keep using their
+    # own existing signals. The structured request is the stable
+    # interpretation contract downstream layers (clarification, constraint
+    # execution) build on; "request_understanding" is None only for the
+    # same cases where the old payloads had no interpretation at all.
+    try:
+        from request_understanding import understand_request
+
+        structured_request = understand_request(query, context_snapshot)
+    except Exception:  # noqa: BLE001 - the layer must never break answering
+        logger.exception("request_understanding failed; continuing without it")
+        structured_request = None
+
+    # ---- Step 4: clarification gate --------------------------------------
+    # NEVER GUESS: when the unified request understanding reports a supported
+    # ambiguity (field / document / reference / constraint), return ONE
+    # deterministic clarification question and stop BEFORE any retrieval or
+    # LLM generation. Conversation and out-of-scope requests can never
+    # clarify (their intent is not document_information), so the existing
+    # conversation/rejected short-circuits below stay reachable exactly as
+    # before. Document candidates come LAZILY from the real store
+    # (available_document_names): clear queries never touch SQLite and no
+    # document option is ever invented.
+    try:
+        from clarification_engine import (
+            available_document_names,
+            build_clarification,
+        )
+
+        clarification = build_clarification(
+            structured_request,
+            context=context_snapshot,
+            available_documents=available_document_names,
+        )
+    except Exception:  # noqa: BLE001 - the gate must never break answering
+        logger.exception("clarification_engine failed; continuing without it")
+        clarification = None
+
+    if clarification is not None and clarification.needed:
+        gate_ms = round((time.perf_counter() - started) * 1000, 3)
+        return {
+            "query": query,
+            "answer": clarification.question or "",
+            "sources": [],
+            "source_documents": [],
+            "retrieval_route": "none",
+            "classification": "clarification",
+            "clarification": clarification.to_dict(),
+            "fallback": {"occurred": False, "reason": None},
+            "grounded": False,
+            "llm_called": False,
+            "insufficient": False,
+            "retrieval_performed": False,
+            "reason": clarification.reason,
+            "language": clarification.language,
+            "context": context_snapshot,
+            "request_understanding": structured_request,
+            "timings_ms": {
+                "router": 0.0,
+                "retrieval": None,
+                "llm_generation": None,
+                "total": gate_ms,
+            },
+        }
 
     # ---- Phase 9: relevance gate ---------------------------------------
     # Deterministic pre-check BEFORE any retrieval/LLM work. Unrelated
@@ -890,6 +982,8 @@ def answer_query(
                 "reason": "conversation_intent",
                 "relevance": gate,
                 "language": conversation["language"],
+                "context": context_snapshot,
+                "request_understanding": structured_request,
                 "timings_ms": {
                     "router": 0.0,
                     "retrieval": None,
@@ -917,6 +1011,8 @@ def answer_query(
             "relevance": gate,
             "scope_reply": True,
             "language": language,
+            "context": context_snapshot,
+            "request_understanding": structured_request,
             "timings_ms": {
                 "router": 0.0,
                 "retrieval": None,
@@ -940,6 +1036,8 @@ def answer_query(
         payload = build_answer_from_exact(route_result)
         payload["retrieval_performed"] = True
         payload["reason"] = "document_related"
+        payload["context"] = context_snapshot
+        payload["request_understanding"] = structured_request
         payload["timings_ms"] = {
             "router": router_ms,
             "retrieval": route_result.get("timings_ms", {}).get("retrieval"),
@@ -965,6 +1063,8 @@ def answer_query(
                 "retrieval_performed": True,
                 "reason": "document_related",
                 "insufficient_reason": route_result.get("insufficient_reason"),
+                "context": context_snapshot,
+                "request_understanding": structured_request,
                 "timings_ms": {
                     "router": router_ms,
                     "retrieval": route_result.get("timings_ms", {}).get("retrieval"),
@@ -999,6 +1099,8 @@ def answer_query(
                     "the retrieved context"
                 ),
                 "model_confidence": None,
+                "context": context_snapshot,
+                "request_understanding": structured_request,
                 "timings_ms": {
                     "router": router_ms,
                     "retrieval": route_result.get("timings_ms", {}).get("retrieval"),
@@ -1045,6 +1147,8 @@ def answer_query(
             "grounding": validated.get("grounding"),
             "unknown_sources": validated.get("unknown_sources", []),
             "retrieved_chunks": chunk_sources,
+            "context": context_snapshot,
+            "request_understanding": structured_request,
             "timings_ms": {
                 "router": router_ms,
                 "retrieval": route_result.get("timings_ms", {}).get("retrieval"),
