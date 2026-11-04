@@ -1,19 +1,13 @@
-# Python
-__pycache__/
-*.py[cod]
-*.pyo
-
-# FreeBuff
-.freebuff/
-
-# SafeDocAI runtime data
-data/safedoc.db
-data/chroma_db/
-data/output/
-data/archive/
-
-# Local uploaded/original documents
-data/samples/
-
-# Local storage
-storage/
+node_modules/
+# User data (documents, output, understood artifacts) stays local...
+data/*
+# ...but OCR engine assets are part of the offline setup and versioned.
+!data/tessdata/
+build/
+dist/
+coverage/
+.DS_Store
+*.log
+server.pid
+.env*
+!.env.example

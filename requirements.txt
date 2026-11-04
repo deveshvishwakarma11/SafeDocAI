@@ -1,9 +1,0 @@
-opencv-python
-numpy
-Pillow
-pytesseract
-pdfplumber
-PyMuPDF
-chromadb>=1.0.0,<1.6.0
-sentence-transformers>=2.0.0
-requests

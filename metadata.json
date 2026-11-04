@@ -1,0 +1,6 @@
+{
+  "name": "SafeDocAI - Local-First Personal Document Intelligence",
+  "description": "Privacy-first personal document assistant. Ask questions in everyday language (English/Hindi/Hinglish), retrieve exact facts and source-grounded answers with 100% on-device data safety.",
+  "requestFramePermissions": [],
+  "majorCapabilities": []
+}
