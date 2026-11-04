@@ -1,130 +1,45 @@
 # SafeDocAI
 
-Offline document AI pipeline that turns scanned PDFs and images into **classified, evidence-verified, searchable** structured data — 100% locally, with no cloud APIs.
+Local-first personal document intelligence. Upload PDFs/images, ask questions in
+English, Hindi or Hinglish, and get answers grounded in your own documents.
+Everything runs on your machine: no cloud APIs, no telemetry.
 
-Drop documents into `data/samples/`, run the pipeline, and get:
+## Run
 
-- **OCR text extraction** (embedded PDF text when reliable, Tesseract OCR fallback when not)
-- **Dynamic document classification** (no fixed type enum — the LLM discovers the document type from evidence)
-- **Field extraction with proof** — every extracted field is validated against the *original* OCR text and marked verified/unverified
-- **Local storage** — SQLite for exact queries, ChromaDB for semantic search
-
-## Pipeline
-
-```
-PDF / Image  (data/samples/)
-        │
-        ▼
-┌─────────────────────────────────────────────┐
-│ Phase 1 — document_parser.py                │
-│  • pdfplumber embedded-text extraction      │
-│  • corruption detection → OCR fallback      │
-│  • OpenCV preprocessing (deskew, threshold) │
-│  • Tesseract OCR (eng + hin if available)   │
-└─────────────────────────────────────────────┘
-        │  data/output/*.json
-        ▼
-┌─────────────────────────────────────────────┐
-│ Phase 3 — document_understanding.py         │
-│  • heuristics.py  — fast regex pre-class    │
-│  • chunker.py     — bounded context windows │
-│  • llm_engine.py  — local Ollama HTTP call  │
-│  • evidence_validator.py — verify vs OCR    │
-└─────────────────────────────────────────────┘
-        │  data/understood/*.json
-        ▼
-┌─────────────────────────────────────────────┐
-│ Phase 2 — storage_engine.py                 │
-│  • SQLite (data/safedoc.db)                 │
-│  • ChromaDB (data/chroma_db/) with          │
-│    all-MiniLM-L6-v2 embeddings              │
-└─────────────────────────────────────────────┘
-```
-
-All inference runs against **http://localhost:11434** (Ollama) over HTTP. No document data ever leaves the machine.
-
-## Requirements
-
-- **Python 3.10+**
-- **Tesseract OCR** installed and on `PATH` (`pytesseract`). Include the `eng` language pack; add `hin` for Hindi documents (the parser auto-selects `eng+hin` when available).
-- **Ollama** running locally with a model (default: `qwen2.5:3b`) — required for Phase 3 only:
-
-  ```bash
-  ollama serve
-  ollama pull qwen2.5:3b
-  ```
-
-Install Python dependencies:
+Prerequisites: Node.js 20+, optional [Ollama](https://ollama.com) with `ollama pull qwen2.5:3b`.
+OCR language data lives in `data/tessdata/` (`eng`, `hin`).
 
 ```bash
-python -m venv .venv
-.venv\Scripts\activate        # Windows
-pip install -r requirements.txt
+npm install
+cp .env.example .env     # optional
+npm run dev              # http://127.0.0.1:3000
+npm test
 ```
 
-## Usage
+## How a question is answered
 
-Run each stage from the project root (modules import each other as top-level scripts):
+1. **Exact fields** (roll number, DOB, amount...) come straight from SQLite. Instant, no model.
+2. **Content search**: the server picks the document by what it *says* (BM25 over stored chunks), not only by file name. It asks "which document?" only when two files genuinely match.
+3. **Local LLM** (Ollama) answers from just the top 3 chunks (~800 chars prompt). Stop cancels generation immediately.
+4. **Verification**: every ID/date/amount in the answer must appear in the retrieved text. Otherwise you get the document's own passage or an honest "couldn't verify", never a guess.
 
-**Phase 1 — Parse documents to OCR JSON**
+No model running? Steps 1, 2 and the verbatim passage still work.
 
-```bash
-python src/document_parser.py                    # parse everything in data/samples/
-python src/document_parser.py --file "path/to/doc.pdf"
-python src/document_parser.py --skip-existing    # skip files that already have JSON
-```
+### Result sheets, statements and other multi-section documents
 
-Supported inputs: `.pdf`, `.jpg`, `.jpeg`, `.png` → written to `data/output/<name>.json`.
+Documents that repeat sections (sessions, semesters, periods) and tables are parsed
+into **scoped facts** and **table rows** (`server/structure.ts`). Questions like
+"Semester 3 ka SGPA", "Maths-I ke marks", "kis subject me fail hua" are answered
+exactly from that structure. A value that exists in several sections (e.g. the SGPA of
+semester 1 in a regular and a back session) is shown for **every** section, never
+collapsed to the first one. Chunks follow the sections too, so a table is never cut in half.
 
-**Phase 2 — Ingest into storage**
+The browser client no longer answers from stored fields itself: the server owns every answer.
 
-```bash
-python src/storage_engine.py    # ingests JSON, runs exact + semantic demo queries
-```
+## Privacy
 
-**Phase 3 — Understand documents**
+- Server listens on `127.0.0.1` only.
+- Originals, SQLite and derived artifacts stay under `data/` (git-ignored).
+- Ollama is called over loopback only.
 
-```bash
-python src/document_understanding.py                          # process all OCR JSONs
-python src/document_understanding.py --file data/output/x.json
-python src/document_understanding.py --check                  # verify Ollama connectivity
-python src/document_understanding.py --test                   # full test suite on samples
-```
-
-Useful flags: `--model`, `--max-context-chars`, `--num-predict`, `--max-llm-windows` (hard cap on LLM calls per document).
-
-## How understanding works
-
-1. **Heuristic pre-classifier** (`heuristics.py`) — pure-Python regex evidence matching runs first, giving a fast, deterministic document-type hypothesis with confidence. It is a fallback layer, not the final answer.
-2. **Bounded context windows** (`chunker.py` + windowing) — long OCR text is split into windows that are *guaranteed* to fit the LLM context budget, with head+tail anchoring (headers and footers survive), overlap between windows, and explicit `[... N characters omitted ...]` markers when the call cap forces gaps. Default cap: **4 LLM calls per document**.
-3. **Local LLM** (`llm_engine.py`) — calls Ollama over HTTP (never subprocess) with JSON-enforced output, `temperature=0`, and generation caps sized for CPU-only hardware.
-4. **Evidence validation** (`evidence_validator.py`) — every LLM-extracted field and the document type itself are checked against the **original, full OCR text** (not the truncated window). Unverified fields are kept but marked. Final classification source is reported as `LLM`, `HEURISTIC`, `HYBRID`, or `UNKNOWN`, with an overall confidence grade.
-
-If Ollama is unreachable, Phase 3 degrades gracefully to heuristic-only classification (clearly marked, confidence `LOW`) instead of failing.
-
-## Data layout
-
-```
-data/
-├── samples/        # input documents (you put files here)
-├── output/         # Phase 1 OCR JSON (raw_text, extraction_method, ...)
-├── understood/     # Phase 3 understanding JSON (type, fields, verification, timing)
-├── safedoc.db      # SQLite storage (Phase 2)
-└── chroma_db/      # ChromaDB vector store (Phase 2)
-```
-
-## Tests
-
-Tests are standalone scripts (no pytest required) and run against temp directories — they never touch the real `data/safedoc.db` or `data/chroma_db/` (an isolation guard verifies the real DB's hash after the run):
-
-```bash
-python tests/test_storage_engine.py
-python tests/test_evidence_validator.py
-python tests/test_long_document_handling.py
-```
-
-## Design notes
-
-- **Offline-first**: every dependency is local. OCR, embeddings, and LLM inference all happen on your machine.
-- **Evidence over trust**: the LLM proposes; the validator disposes. Fields unsupported by the original OCR text are flagged, never silently accepted.
-- **CPU-friendly**: bounded windows, capped LLM calls per document, and generation limits keep the pipeline usable on low-RAM laptops.
+Product docs: PRD, TRD and App Flow (kept outside this repo).
